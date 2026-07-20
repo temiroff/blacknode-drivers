@@ -20,17 +20,16 @@ node-types = ["FeetechBusConfig", "FeetechBusProbe"]
 pip = ["feetech-servo-sdk>=1.0"]
 imports = ["scservo_sdk"]
 
-[components.feetech-ros2]
+[components.feetech.adapters.ros2]
 description = "ROS 2 and rosbridge process adapter for the Feetech joint driver."
 default = false
 capabilities = ["adapter.feetech.ros2", "robot.joint-state-transport"]
-nodes = ["components/feetech-ros2/nodes"]
+nodes = ["components/feetech/adapters/ros2/nodes"]
 node-types = ["FeetechROS2Adapter"]
 
-[components.feetech-ros2.dependencies]
+[components.feetech.adapters.ros2.dependencies]
 pip = ["roslibpy>=1.5"]
 imports = ["roslibpy"]
 requires = [
-  { component = "feetech", version = ">=0.1.0,<1.0.0" },
   { package = "blacknode-ros2", component = "core", version = ">=0.2.0,<1.0.0" },
 ]

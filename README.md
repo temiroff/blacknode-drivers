@@ -1,9 +1,9 @@
 # blacknode-drivers
 
-Physical drivers are selectable components. `feetech` owns the transport-
-neutral bus contract and safeguards. The optional `feetech-ros2` component
-owns the joint-driver process adapter and depends on both `feetech` and
-`blacknode-ros2/core`; enabling it resolves those dependencies first.
+Physical drivers are selectable components. `feetech` owns its transport-
+neutral bus contract, safeguards, runtimes, and optional adapters. Its nested
+`ros2` adapter depends on `blacknode-ros2/core`; enabling that adapter resolves
+the ROS dependency while the component remains simply `feetech`.
 
 Physical hardware-driver components for Blacknode robotics workflows.
 
@@ -48,8 +48,9 @@ the SDK or attached servos.
 `blacknode-drivers` owns physical protocol access and final driver-boundary
 safeguards. `blacknode-robot` owns robot models, profiles, calibration, and
 capability contracts. `blacknode-ros2` owns ROS graph and transport behavior.
-A later `feetech-ros2` adapter component will connect this bus implementation
-to the ROS interface after cross-package component dependencies are available.
+The optional `ros2` adapter nested under `feetech` connects this bus
+implementation to the ROS interface while hardware ownership stays inside the
+Feetech component.
 
 ## Safety
 

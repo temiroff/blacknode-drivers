@@ -30,8 +30,8 @@ calibration ownership in `blacknode-robot`, generic controllers in
 - Components are selectively loaded through `blacknode-package.toml`; keep
   optional vendor imports out of module top level.
 - A hardware component may expose transport-neutral configuration and runtime
-  primitives. Put ROS-specific message and process adapters in an explicit ROS
-  adapter component with versioned dependencies on the hardware component and
+  primitives. Keep integration-specific adapters nested under their owning
+  component, and give each optional adapter versioned dependencies such as
   `blacknode-ros2/core`.
 - Preserve node names used by saved workflows or provide compatibility aliases.
 - Keep every component independently mock-testable without attached hardware.
