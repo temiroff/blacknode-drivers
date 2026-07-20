@@ -69,7 +69,7 @@ From the Blacknode repository root:
 
 ```powershell
 python -m pytest packages/blacknode-drivers/tests
-python -m blacknode.cli validate packages/blacknode-drivers/templates/feetech-bus-config.json
+python -m blacknode.cli validate packages/blacknode-drivers/components/feetech/templates/feetech-bus-config.json
 ```
 
 ## License

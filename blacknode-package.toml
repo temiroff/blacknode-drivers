@@ -1,8 +1,8 @@
 [package]
 name = "blacknode-drivers"
-version = "0.1.0"
+version = "0.2.0"
 description = "Physical hardware drivers and firmware adapters for Blacknode robots."
-requires-blacknode = ">=0.1.0"
+requires-blacknode = ">=0.3.0"
 layer = "drivers"
 component-mode = true
 
@@ -14,6 +14,7 @@ description = "Feetech STS/SMS serial-bus configuration, read-only probing, and 
 default = true
 capabilities = ["driver.feetech", "driver.serial-servo", "robot.joint-driver"]
 nodes = ["components/feetech/nodes"]
+templates = ["components/feetech/templates"]
 node-types = ["FeetechBusConfig", "FeetechBusProbe"]
 
 [components.feetech.dependencies]
