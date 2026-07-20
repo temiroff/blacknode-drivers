@@ -1,0 +1,2 @@
+# Shared dependencies belong here. Vendor-specific dependencies are declared
+# by each selectively enabled component in blacknode-package.toml.

@@ -1,0 +1,71 @@
+{
+  "kind": "blacknode.workflow",
+  "schema_version": 1,
+  "name": "Feetech Bus Configuration",
+  "saved_at": "2026-07-20T00:00:00",
+  "entrypoint": {
+    "node_id": "feetech",
+    "port": "config"
+  },
+  "metadata": {
+    "template": true,
+    "description": "Build and validate an inert Feetech STS/SMS serial-bus configuration. This workflow opens no hardware and keeps motion disarmed.",
+    "color": "#f97316",
+    "required_packages": [
+      "blacknode-drivers"
+    ]
+  },
+  "node_meta": {
+    "feetech": {
+      "id": "feetech",
+      "type": "FeetechBusConfig",
+      "params": {
+        "profile": {},
+        "port": "COM3",
+        "baudrate": 1000000,
+        "joints": "shoulder_pan:1:-100:100,shoulder_lift:2:-100:100,elbow_flex:3:-100:100,wrist_flex:4:-100:100,wrist_roll:5:-150:150,gripper:6:-10:90",
+        "home_ticks": "",
+        "invert": ""
+      },
+      "pos": [
+        120,
+        120
+      ],
+      "inputs": [
+        "profile",
+        "port",
+        "baudrate",
+        "joints",
+        "home_ticks",
+        "invert"
+      ],
+      "outputs": [
+        "ready",
+        "config",
+        "report"
+      ],
+      "input_types": {
+        "profile": "Dict",
+        "port": "Text",
+        "baudrate": "Int",
+        "joints": "Text",
+        "home_ticks": "Text",
+        "invert": "Text"
+      },
+      "output_types": {
+        "ready": "Bool",
+        "config": "Dict",
+        "report": "Text"
+      },
+      "input_defaults": {
+        "profile": {},
+        "port": "",
+        "baudrate": 1000000,
+        "joints": "shoulder_pan:1:-100:100,shoulder_lift:2:-100:100,elbow_flex:3:-100:100,wrist_flex:4:-100:100,wrist_roll:5:-150:150,gripper:6:-10:90",
+        "home_ticks": "",
+        "invert": ""
+      }
+    }
+  },
+  "edges": []
+}

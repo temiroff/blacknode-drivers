@@ -1,0 +1,230 @@
+import math
+from types import SimpleNamespace
+
+import pytest
+
+import blacknode  # noqa: F401 - triggers extension package discovery
+from blacknode.node import _NODE_REGISTRY
+from blacknode.packages import _PACKAGE_REGISTRY
+from blacknode.pkg.blacknode_drivers.feetech import bus
+
+
+def test_feetech_component_registers_expected_nodes():
+    info = _PACKAGE_REGISTRY["blacknode-drivers"]
+
+    assert info.ok
+    assert info.layer == "drivers"
+    assert info.component_mode is True
+    assert info.enabled_components == ["feetech"]
+    assert info.components["feetech"]["capabilities"] == [
+        "driver.feetech",
+        "driver.serial-servo",
+        "robot.joint-driver",
+    ]
+    assert info.pip_dependencies == ["feetech-servo-sdk>=1.0"]
+    assert {"FeetechBusConfig", "FeetechBusProbe"}.issubset(info.node_types)
+    assert _NODE_REGISTRY["FeetechBusConfig"]._bn_component == "feetech"
+
+
+def test_feetech_config_is_inert_and_accepts_robot_profile():
+    profile = {
+        "id": "test_arm",
+        "joints": [
+            {
+                "id": "shoulder",
+                "servo_id": 1,
+                "min_deg": -90,
+                "max_deg": 90,
+                "safe_min_deg": -75,
+                "safe_max_deg": 70,
+                "home_ticks": 2100,
+                "invert": True,
+            }
+        ],
+    }
+
+    result = _NODE_REGISTRY["FeetechBusConfig"]({
+        "profile": profile,
+        "port": "COM7",
+        "baudrate": 1_000_000,
+    })
+
+    assert result["ready"] is True
+    assert result["config"]["driver"] == "feetech"
+    assert result["config"]["motion_armed"] is False
+    assert result["config"]["joints"] == [{
+        "name": "shoulder",
+        "servo_id": 1,
+        "min_deg": -75.0,
+        "max_deg": 70.0,
+        "home_ticks": 2100,
+        "invert": True,
+    }]
+    assert "configuration opens no hardware" in result["report"]
+
+
+def test_feetech_probe_requires_explicit_confirmation(monkeypatch):
+    monkeypatch.setattr(
+        bus,
+        "probe_bus",
+        lambda _config: (_ for _ in ()).throw(AssertionError("hardware must stay closed")),
+    )
+
+    result = _NODE_REGISTRY["FeetechBusProbe"]({
+        "config": {"port": "COM7"},
+        "confirm_read_only": False,
+    })
+
+    assert result["connected"] is False
+    assert "BLOCKED" in result["report"]
+
+
+def test_joint_parsing_conversion_and_validation():
+    joints = bus.parse_joint_map(
+        "shoulder:1:-90:90,gripper:6:-10:80",
+        {"shoulder": 2100},
+        {"shoulder"},
+    )
+    shoulder = joints["shoulder"]
+
+    assert shoulder.home_ticks == 2100
+    assert shoulder.invert is True
+    assert bus.ticks_to_degrees(shoulder.home_ticks, shoulder) == 0.0
+    assert bus.degrees_to_ticks(10.0, shoulder) < shoulder.home_ticks
+    assert bus.clamp_degrees(999.0, shoulder) == 90.0
+    assert math.isclose(
+        bus.ticks_to_degrees(bus.degrees_to_ticks(45.0, joints["gripper"]), joints["gripper"]),
+        45.0,
+    )
+
+    with pytest.raises(ValueError, match="duplicated"):
+        bus.parse_joint_map("a:1:-10:10,b:1:-10:10")
+    with pytest.raises(ValueError, match="minimum"):
+        bus.parse_joint_map("a:1:10:-10")
+
+
+def test_read_only_probe_never_calls_write_methods():
+    calls = []
+
+    class Port:
+        def openPort(self):
+            calls.append("open")
+            return True
+
+        def setBaudRate(self, baudrate):
+            calls.append(("baud", baudrate))
+            return True
+
+        def closePort(self):
+            calls.append("close")
+
+    class Packet:
+        def read2ByteTxRx(self, _port, servo_id, address):
+            calls.append(("read", servo_id, address))
+            return 2048 + servo_id, 0, 0
+
+    fake_sdk = SimpleNamespace(
+        COMM_SUCCESS=0,
+        PortHandler=lambda _name: Port(),
+        PacketHandler=lambda _protocol: Packet(),
+    )
+    config = {
+        "port": "COM7",
+        "baudrate": 1_000_000,
+        "joints": [
+            bus.JointSpec("shoulder", 1, -90, 90).to_dict(),
+            bus.JointSpec("gripper", 6, -10, 80).to_dict(),
+        ],
+    }
+
+    result = bus.probe_bus(config, sdk=fake_sdk)
+
+    assert result["ok"] is True
+    assert set(result["readings"]) == {"shoulder", "gripper"}
+    assert calls == [
+        "open",
+        ("baud", 1_000_000),
+        ("read", 1, bus.ADDR_PRESENT_POSITION[0]),
+        ("read", 6, bus.ADDR_PRESENT_POSITION[0]),
+        "close",
+    ]
+
+
+def test_torque_enable_reads_and_seeds_every_joint_before_holding():
+    joints = bus.parse_joint_map("shoulder:1:-90:90,gripper:6:-10:80")
+    calls = []
+
+    class Packet:
+        def read2ByteTxRx(self, _port, servo_id, _address):
+            calls.append(("read", servo_id))
+            return 2000 + servo_id, 0, 0
+
+        def write2ByteTxRx(self, _port, servo_id, _address, ticks):
+            calls.append(("goal", servo_id, ticks))
+            return 0, 0
+
+        def write1ByteTxRx(self, _port, servo_id, _address, enabled):
+            calls.append(("torque", servo_id, enabled))
+            return 0, 0
+
+    ok, positions, error = bus.enable_all_torque_at_current_pose(
+        SimpleNamespace(COMM_SUCCESS=0), Packet(), object(), joints
+    )
+
+    assert ok is True
+    assert error == ""
+    assert positions == {"shoulder": 2001, "gripper": 2006}
+    assert calls == [
+        ("read", 1),
+        ("read", 6),
+        ("goal", 1, 2001),
+        ("goal", 6, 2006),
+        ("torque", 1, 1),
+        ("torque", 6, 1),
+    ]
+
+
+def test_partial_seed_failure_returns_all_joints_to_torque_off():
+    joints = bus.parse_joint_map("shoulder:1:-90:90,gripper:6:-10:80")
+    torque_writes = []
+
+    class Packet:
+        def read2ByteTxRx(self, _port, _servo_id, _address):
+            return 2048, 0, 0
+
+        def write2ByteTxRx(self, _port, servo_id, _address, _ticks):
+            return (1, 0) if servo_id == 6 else (0, 0)
+
+        def write1ByteTxRx(self, _port, servo_id, _address, enabled):
+            torque_writes.append((servo_id, enabled))
+            return 0, 0
+
+    ok, _positions, error = bus.enable_all_torque_at_current_pose(
+        SimpleNamespace(COMM_SUCCESS=0), Packet(), object(), joints
+    )
+
+    assert ok is False
+    assert "could not seed Goal_Position for gripper" in error
+    assert torque_writes == [(1, 0), (6, 0)]
+
+
+def test_position_writes_are_clamped_at_driver_boundary():
+    joints = bus.parse_joint_map("shoulder:1:-30:40")
+    writes = []
+    packet = SimpleNamespace(
+        write2ByteTxRx=lambda _port, servo_id, _address, ticks: writes.append(
+            (servo_id, ticks)
+        ) or (0, 0)
+    )
+
+    ok, error = bus.write_joint_positions(
+        SimpleNamespace(COMM_SUCCESS=0),
+        packet,
+        object(),
+        joints,
+        {"shoulder": 999.0},
+    )
+
+    assert ok is True
+    assert error == ""
+    assert writes == [(1, bus.degrees_to_ticks(40.0, joints["shoulder"]))]
