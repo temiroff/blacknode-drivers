@@ -1,8 +1,8 @@
 [package]
 name = "blacknode-drivers"
-version = "0.1.0"
+version = "0.2.0"
 description = "Physical hardware drivers and firmware adapters for Blacknode robots."
-requires-blacknode = ">=0.1.0"
+requires-blacknode = ">=0.3.0"
 layer = "drivers"
 component-mode = true
 
@@ -14,8 +14,23 @@ description = "Feetech STS/SMS serial-bus configuration, read-only probing, and 
 default = true
 capabilities = ["driver.feetech", "driver.serial-servo", "robot.joint-driver"]
 nodes = ["components/feetech/nodes"]
+templates = ["components/feetech/templates"]
 node-types = ["FeetechBusConfig", "FeetechBusProbe"]
 
 [components.feetech.dependencies]
 pip = ["feetech-servo-sdk>=1.0"]
 imports = ["scservo_sdk"]
+
+[components.feetech.adapters.ros2]
+description = "ROS 2 and rosbridge process adapter for the Feetech joint driver."
+default = false
+capabilities = ["adapter.feetech.ros2", "robot.joint-state-transport"]
+nodes = ["components/feetech/adapters/ros2/nodes"]
+node-types = ["FeetechROS2Adapter"]
+
+[components.feetech.adapters.ros2.dependencies]
+pip = ["roslibpy>=1.5"]
+imports = ["roslibpy"]
+requires = [
+  { package = "blacknode-ros2", component = "core", version = ">=0.2.0,<1.0.0" },
+]
