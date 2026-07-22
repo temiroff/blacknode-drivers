@@ -7,7 +7,7 @@ from blacknode.node import Bool, Dict, Int, Text, node
 
 from . import bus
 
-_CATEGORY = "Hardware Drivers"
+_CATEGORY = "Drivers"
 _DEFAULT_JOINTS = (
     "shoulder_pan:1:-100:100,shoulder_lift:2:-100:100,"
     "elbow_flex:3:-100:100,wrist_flex:4:-100:100,"

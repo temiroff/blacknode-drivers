@@ -9,7 +9,7 @@ from blacknode.node import Dict, Text, node
 
 @node(
     name="FeetechROS2Adapter",
-    category="Hardware Drivers",
+    category="Drivers",
     description="Resolve the Feetech joint driver process used by native ROS 2 and rosbridge transports. This node opens no hardware and never arms motion.",
     inputs={"config": Dict},
     outputs={"adapter": Dict, "report": Text},

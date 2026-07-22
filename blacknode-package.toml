@@ -7,7 +7,7 @@ layer = "drivers"
 component-mode = true
 
 [categories]
-"Hardware Drivers" = "#f97316"
+"Drivers" = "#f97316"
 
 [components.feetech]
 description = "Feetech STS/SMS serial-bus configuration, read-only probing, and safety primitives."
@@ -34,3 +34,45 @@ imports = ["roslibpy"]
 requires = [
   { package = "blacknode-ros2", component = "core", version = ">=0.2.0,<1.0.0" },
 ]
+
+# Roadmap component; sources land in components/stm32/nodes.
+[components.stm32]
+description = "STM32 firmware and serial control adapters."
+default = false
+capabilities = ["driver.stm32"]
+
+# Roadmap component; sources land in components/serial/nodes.
+[components.serial]
+description = "Generic serial-port transport primitives."
+default = false
+capabilities = ["driver.serial"]
+
+# Roadmap component; sources land in components/can/nodes.
+[components.can]
+description = "CAN bus transport and frame codecs."
+default = false
+capabilities = ["driver.can"]
+
+# Roadmap component; sources land in components/usb/nodes.
+[components.usb]
+description = "USB device enumeration and permissions."
+default = false
+capabilities = ["driver.usb"]
+
+# Roadmap component; sources land in components/motor-controllers/nodes.
+[components.motor-controllers]
+description = "Motor controller and ESC drivers."
+default = false
+capabilities = ["driver.motor-controllers"]
+
+# Roadmap component; sources land in components/sensor-drivers/nodes.
+[components.sensor-drivers]
+description = "Discrete sensor hardware drivers."
+default = false
+capabilities = ["driver.sensor-drivers"]
+
+# Roadmap component; sources land in components/vendor-adapters/nodes.
+[components.vendor-adapters]
+description = "Vendor SDK shims kept out of the generic robot layer."
+default = false
+capabilities = ["driver.vendor-adapters"]
