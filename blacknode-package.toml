@@ -7,7 +7,7 @@ layer = "drivers"
 component-mode = true
 
 [categories]
-"Drivers" = "#f97316"
+"Drivers" = "#a16207"
 
 [components.feetech]
 description = "Feetech STS/SMS serial-bus configuration, read-only probing, and safety primitives."
