@@ -15,7 +15,9 @@ default = true
 capabilities = ["driver.feetech", "driver.serial-servo", "robot.joint-driver"]
 nodes = ["components/feetech/nodes"]
 templates = ["components/feetech/templates"]
-node-types = ["FeetechBusConfig", "FeetechBusProbe"]
+node-types = [
+  "FeetechBusConfig", "FeetechBusProbe"
+]
 
 [components.feetech.dependencies]
 pip = ["feetech-servo-sdk>=1.0"]
