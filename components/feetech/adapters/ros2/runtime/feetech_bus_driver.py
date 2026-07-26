@@ -142,6 +142,36 @@ def _joint_state_payload(ticks_by_name: dict[str, int], joints: dict[str, JointS
     }
 
 
+def _deployment_telemetry_publisher() -> Any | None:
+    """Load the optional runtime bridge only inside a managed deployment."""
+    try:
+        from blacknode_runtime.telemetry import DeploymentTelemetryPublisher
+    except ImportError:
+        return None
+    publisher = DeploymentTelemetryPublisher.from_env()
+    return publisher if publisher.enabled else None
+
+
+def _publish_deployment_state(
+    publisher: Any | None,
+    ticks_by_name: dict[str, int],
+    joints: dict[str, JointSpec],
+    control_state: dict[str, Any],
+) -> None:
+    if publisher is None:
+        return
+    publisher.publish_robot_state(
+        {
+            name: ticks_to_degrees(ticks, joints[name])
+            for name, ticks in ticks_by_name.items()
+        },
+        torque_enabled=bool(control_state["torque_enabled"]),
+        connected=True,
+        position_unit="degree",
+        error=str(control_state["last_error"]),
+    )
+
+
 def _config_payload(
     joints: dict[str, JointSpec],
     *,
@@ -216,6 +246,11 @@ def _run_rosbridge(
     bus_lock = threading.Lock()
     control_state: dict[str, Any] = {"torque_enabled": True, "last_error": ""}
     last_known_ticks = dict(current_ticks)
+    telemetry = _deployment_telemetry_publisher()
+
+    def publish_state() -> None:
+        state_pub.publish(roslibpy.Message(_joint_state_payload(last_known_ticks, joints)))
+        _publish_deployment_state(telemetry, last_known_ticks, joints, control_state)
 
     def publish_config() -> None:
         config_pub.publish(roslibpy.Message({
@@ -267,7 +302,7 @@ def _run_rosbridge(
     control_sub.subscribe(apply_control_safely)
     try:
         publish_config()
-        state_pub.publish(roslibpy.Message(_joint_state_payload(last_known_ticks, joints)))
+        publish_state()
         period = 1.0 / max(0.1, args.rate_hz)
         was_connected = True
         while not stop_event.wait(period):
@@ -281,11 +316,11 @@ def _run_rosbridge(
                 if stop_event.wait(1.1) or not ros.is_connected:
                     continue
                 publish_config()
-                state_pub.publish(roslibpy.Message(_joint_state_payload(last_known_ticks, joints)))
+                publish_state()
                 was_connected = True
             with bus_lock:
                 last_known_ticks.update(_sync_read_positions(sdk, packet, port, joints))
-            state_pub.publish(roslibpy.Message(_joint_state_payload(last_known_ticks, joints)))
+            publish_state()
     finally:
         try:
             command_sub.unsubscribe()
@@ -293,6 +328,8 @@ def _run_rosbridge(
             state_pub.unadvertise()
             config_pub.unadvertise()
         finally:
+            if telemetry is not None:
+                telemetry.close()
             ros.terminate()
 
 
@@ -593,6 +630,7 @@ def main() -> int:
     config_pub = node.create_publisher(String, args.config_topic, config_qos)
     control_state: dict[str, Any] = {"torque_enabled": True, "last_error": ""}
     bus_lock = threading.Lock()
+    telemetry = _deployment_telemetry_publisher()
 
     def publish_state(ticks_by_name: dict[str, int]) -> None:
         msg = JointState()
@@ -602,6 +640,7 @@ def main() -> int:
         msg.velocity = []
         msg.effort = []
         state_pub.publish(msg)
+        _publish_deployment_state(telemetry, ticks_by_name, joints, control_state)
 
     # First /joint_states publish is the just-seeded pose (real hardware
     # position), so ROS2SetJoint's "sync to current pose" has a real
@@ -667,6 +706,8 @@ def main() -> int:
         if rclpy.ok():
             rclpy.shutdown()
         port.closePort()
+        if telemetry is not None:
+            telemetry.close()
 
     return 0
 

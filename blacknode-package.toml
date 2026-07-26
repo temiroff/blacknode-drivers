@@ -1,6 +1,6 @@
 [package]
 name = "blacknode-drivers"
-version = "0.2.0"
+version = "0.2.1"
 description = "Physical hardware drivers and firmware adapters for Blacknode robots."
 requires-blacknode = ">=0.3.0"
 layer = "drivers"

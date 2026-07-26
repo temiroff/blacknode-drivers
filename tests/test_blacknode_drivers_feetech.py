@@ -1,4 +1,6 @@
 import math
+import runpy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -257,3 +259,39 @@ def test_position_writes_are_clamped_at_driver_boundary():
     assert ok is True
     assert error == ""
     assert writes == [(1, bus.degrees_to_ticks(40.0, joints["shoulder"]))]
+
+
+def test_deployed_driver_reports_read_only_joint_and_torque_telemetry():
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "components"
+        / "feetech"
+        / "adapters"
+        / "ros2"
+        / "runtime"
+        / "feetech_bus_driver.py"
+    )
+    runtime = runpy.run_path(str(runtime_path))
+    joint = runtime["JointSpec"]("shoulder", 1, -90.0, 90.0)
+    published = []
+
+    class Publisher:
+        def publish_robot_state(self, positions, **metadata):
+            published.append((positions, metadata))
+
+    runtime["_publish_deployment_state"](
+        Publisher(),
+        {"shoulder": 2048},
+        {"shoulder": joint},
+        {"torque_enabled": False, "last_error": ""},
+    )
+
+    assert published == [(
+        {"shoulder": 0.0},
+        {
+            "torque_enabled": False,
+            "connected": True,
+            "position_unit": "degree",
+            "error": "",
+        },
+    )]

@@ -52,6 +52,12 @@ The optional `ros2` adapter nested under `feetech` connects this bus
 implementation to the ROS interface while hardware ownership stays inside the
 Feetech component.
 
+When the Feetech ROS 2 driver runs inside Blacknode Runtime 0.3.9 or newer, it
+also publishes the same read-only joint and torque state to the runtime's local
+deployment telemetry bridge. This lets the editor monitor the robot after the
+deployment takes ownership of the serial bus. Outside a managed deployment the
+bridge is absent and the driver continues normally.
+
 ## Safety
 
 - Configuration is inert and opens no hardware.
