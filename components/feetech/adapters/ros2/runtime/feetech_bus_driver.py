@@ -474,10 +474,37 @@ def _sync_write_goals(
 def _write_goal(sdk: Any, packet: Any, port: Any, servo_id: int, ticks: int, *, confirm: bool) -> bool:
     address, _width = ADDR_GOAL_POSITION
     if confirm:
-        comm_result, servo_error = packet.write2ByteTxRx(port, servo_id, address, ticks)
-        if comm_result != sdk.COMM_SUCCESS or servo_error != 0:
-            return False
-        return True
+        # Seeding the current pose is idempotent. A Feetech servo can apply a
+        # write even when its acknowledgement is lost on the half-duplex bus,
+        # especially near the end of a daisy chain. Retry the same safe goal
+        # and accept an explicit register readback as confirmation.
+        for _attempt in range(3):
+            try:
+                comm_result, servo_error = packet.write2ByteTxRx(
+                    port,
+                    servo_id,
+                    address,
+                    ticks,
+                )
+            except Exception:
+                comm_result, servo_error = None, None
+            if comm_result == sdk.COMM_SUCCESS and servo_error == 0:
+                return True
+            try:
+                confirmed_ticks, read_result, read_error = packet.read2ByteTxRx(
+                    port,
+                    servo_id,
+                    address,
+                )
+            except Exception:
+                continue
+            if (
+                read_result == sdk.COMM_SUCCESS
+                and read_error == 0
+                and int(confirmed_ticks) == int(ticks)
+            ):
+                return True
+        return False
     packet.write2ByteTxOnly(port, servo_id, address, ticks)
     return True
 
