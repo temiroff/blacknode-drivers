@@ -284,6 +284,49 @@ def test_driver_startup_disables_torque_before_reading_pose():
     ]
 
 
+def test_driver_ros_node_name_is_unique_per_robot_topic_namespace():
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "components"
+        / "feetech"
+        / "adapters"
+        / "ros2"
+        / "runtime"
+        / "feetech_bus_driver.py"
+    )
+    runtime = runpy.run_path(str(runtime_path))
+    node_name = runtime["ros_node_name"]
+
+    assert node_name("/leader/joint_states") == "blacknode_feetech_bus_driver_leader"
+    assert node_name("/follower/joint_states") == "blacknode_feetech_bus_driver_follower"
+    assert node_name("/joint_states") == "blacknode_feetech_bus_driver"
+    assert node_name("/ignored", "arm 1/driver") == "arm_1_driver"
+    assert node_name("/ignored", "123-driver") == "blacknode_123_driver"
+
+
+def test_read_only_driver_advertises_no_command_authority():
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "components"
+        / "feetech"
+        / "adapters"
+        / "ros2"
+        / "runtime"
+        / "feetech_bus_driver.py"
+    )
+    runtime = runpy.run_path(str(runtime_path))
+    joint = runtime["JointSpec"]("shoulder", 1, -90.0, 90.0)
+
+    config = runtime["_config_payload"](
+        {"shoulder": joint},
+        torque_enabled=True,
+        commands_allowed=False,
+    )
+
+    assert config["torque_enabled"] is True
+    assert config["commands_allowed"] is False
+
+
 def test_position_writes_are_clamped_at_driver_boundary():
     joints = bus.parse_joint_map("shoulder:1:-30:40")
     writes = []
