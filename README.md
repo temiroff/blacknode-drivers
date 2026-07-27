@@ -62,6 +62,8 @@ bridge is absent and the driver continues normally.
 
 - Configuration is inert and opens no hardware.
 - Probing is read-only and requires `confirm_read_only=true`.
+- Driver startup disables torque on every configured joint before reporting
+  state. Support the robot because a previously holding arm may become limp.
 - Torque enable primitives read every joint, seed the current positions as
   goals while torque is off, and then enable torque.
 - Any partial failure returns every configured joint to torque-off.

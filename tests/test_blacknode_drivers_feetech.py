@@ -239,6 +239,51 @@ def test_partial_seed_failure_returns_all_joints_to_torque_off():
     assert torque_writes == [(1, 0), (6, 0)]
 
 
+def test_driver_startup_disables_torque_before_reading_pose():
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "components"
+        / "feetech"
+        / "adapters"
+        / "ros2"
+        / "runtime"
+        / "feetech_bus_driver.py"
+    )
+    runtime = runpy.run_path(str(runtime_path))
+    joints = runtime["parse_joint_map"](
+        "shoulder:1:-90:90,gripper:6:-10:80",
+        {},
+        set(),
+    )
+    calls = []
+
+    class Packet:
+        def write1ByteTxRx(self, _port, servo_id, _address, enabled):
+            calls.append(("torque", servo_id, enabled))
+            return 0, 0
+
+        def read2ByteTxRx(self, _port, servo_id, _address):
+            calls.append(("read", servo_id))
+            return 2000 + servo_id, 0, 0
+
+    ok, positions, error = runtime["_prepare_released_startup"](
+        SimpleNamespace(COMM_SUCCESS=0),
+        Packet(),
+        object(),
+        joints,
+    )
+
+    assert ok is True
+    assert positions == {"shoulder": 2001, "gripper": 2006}
+    assert error == ""
+    assert calls == [
+        ("torque", 1, 0),
+        ("torque", 6, 0),
+        ("read", 1),
+        ("read", 6),
+    ]
+
+
 def test_position_writes_are_clamped_at_driver_boundary():
     joints = bus.parse_joint_map("shoulder:1:-30:40")
     writes = []

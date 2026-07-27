@@ -244,7 +244,7 @@ def _run_rosbridge(
     command_sub = roslibpy.Topic(ros, args.command_topic, "sensor_msgs/msg/JointState")
     control_sub = roslibpy.Topic(ros, args.control_topic, "std_msgs/msg/String")
     bus_lock = threading.Lock()
-    control_state: dict[str, Any] = {"torque_enabled": True, "last_error": ""}
+    control_state: dict[str, Any] = {"torque_enabled": False, "last_error": ""}
     last_known_ticks = dict(current_ticks)
     telemetry = _deployment_telemetry_publisher()
 
@@ -454,6 +454,36 @@ def _disable_all_torque(
     return True, ""
 
 
+def _prepare_released_startup(
+    sdk: Any,
+    packet: Any,
+    port: Any,
+    joints: dict[str, JointSpec],
+) -> tuple[bool, dict[str, int], str]:
+    """Start from a verified limp state and capture the initial joint pose.
+
+    Opening a driver is discovery, not motion authorization. Disable every
+    configured servo before reading state so a prior crashed process cannot
+    leave holding torque active under a new deployment.
+    """
+    released, release_error = _disable_all_torque(sdk, packet, port, joints)
+    if not released:
+        return False, {}, release_error
+    current_ticks: dict[str, int] = {}
+    for name, joint in joints.items():
+        ticks = _read_position_or_none(sdk, packet, port, joint.servo_id)
+        if ticks is None:
+            _disable_all_torque(sdk, packet, port, joints)
+            return (
+                False,
+                current_ticks,
+                f"could not read Present_Position for {name} "
+                f"(servo id {joint.servo_id}) with torque released",
+            )
+        current_ticks[name] = ticks
+    return True, current_ticks, ""
+
+
 def _enable_all_torque_at_current_pose(
     sdk: Any,
     packet: Any,
@@ -587,16 +617,17 @@ def main() -> int:
     port = _open_port(sdk, args.port, args.baudrate)
     packet = sdk.PacketHandler(0)
 
-    # --- Torque-enable safety sequence -------------------------------------
-    # Feetech STS servos snap toward whatever is already sitting in
-    # Goal_Position the instant Torque_Enable switches on. That register is
-    # NOT guaranteed to already equal the servo's physical position (stale
-    # value from a previous session, or a register default). So: read first,
-    # seed Goal_Position with the just-read value while torque is still off,
-    # THEN enable torque -- there is nothing left for the servo to snap toward.
-    enabled, current_ticks, enable_error = _enable_all_torque_at_current_pose(sdk, packet, port, joints)
-    if not enabled:
-        _fail(enable_error)
+    # Driver startup is always disarmed. Holding torque is enabled only by the
+    # explicit ``exit_teach`` control path, which first seeds every goal from
+    # the current physical pose.
+    released, current_ticks, release_error = _prepare_released_startup(
+        sdk,
+        packet,
+        port,
+        joints,
+    )
+    if not released:
+        _fail(release_error)
 
     stop_event = threading.Event()
 
@@ -628,7 +659,7 @@ def main() -> int:
     state_pub = node.create_publisher(JointState, args.state_topic, 10)
     config_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
     config_pub = node.create_publisher(String, args.config_topic, config_qos)
-    control_state: dict[str, Any] = {"torque_enabled": True, "last_error": ""}
+    control_state: dict[str, Any] = {"torque_enabled": False, "last_error": ""}
     bus_lock = threading.Lock()
     telemetry = _deployment_telemetry_publisher()
 
