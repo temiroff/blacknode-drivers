@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import signal
 import sys
 import threading
@@ -40,6 +41,42 @@ _DEFAULT_HOME_TICKS = 2048     # protocol mid-point; override per-joint with --h
 ADDR_TORQUE_ENABLE = (40, 1)
 ADDR_GOAL_POSITION = (42, 2)
 ADDR_PRESENT_POSITION = (56, 2)
+
+
+def ros_node_name(state_topic: str, explicit_name: str = "") -> str:
+    """Return a stable ROS-safe driver name, scoped by the topic namespace."""
+    requested = explicit_name.strip()
+    if requested:
+        candidate = requested.strip("/")
+    else:
+        parts = [part for part in state_topic.split("/") if part]
+        scope = parts[0] if len(parts) > 1 else ""
+        candidate = "blacknode_feetech_bus_driver"
+        if scope:
+            candidate = f"{candidate}_{scope}"
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", candidate)
+    safe = re.sub(r"_+", "_", safe).strip("_")
+    if not safe:
+        return "blacknode_feetech_bus_driver"
+    if safe[0].isdigit():
+        safe = f"blacknode_{safe}"
+    return safe
+
+
+def _create_ros_node(rclpy: Any, node_name: str):
+    options = {
+        "enable_rosout": False,
+        "start_parameter_services": False,
+        "enable_type_description_service": False,
+    }
+    try:
+        return rclpy.create_node(node_name, **options)
+    except TypeError:
+        options.pop("enable_type_description_service")
+        try:
+            return rclpy.create_node(node_name, **options)
+        except TypeError:
+            return rclpy.create_node(node_name)
 
 
 @dataclass(frozen=True)
@@ -176,10 +213,12 @@ def _config_payload(
     joints: dict[str, JointSpec],
     *,
     torque_enabled: bool = True,
+    commands_allowed: bool | None = None,
     last_error: str = "",
 ) -> dict[str, Any]:
+    allowed = torque_enabled if commands_allowed is None else bool(commands_allowed)
     return {
-        "commands_allowed": torque_enabled,
+        "commands_allowed": allowed,
         "torque_enabled": torque_enabled,
         "teach_mode": not torque_enabled,
         "mode": "hold" if torque_enabled else "teach",
@@ -225,6 +264,7 @@ def _run_rosbridge(
     stop_event: threading.Event,
 ) -> None:
     roslibpy = imports["roslibpy"]
+    read_only = bool(getattr(args, "read_only", False))
     ros = roslibpy.Ros(host=args.host, port=args.rosbridge_port)
     # ``roslibpy`` uses a reconnecting Twisted client. Keep its reactor and
     # topic objects alive for the lifetime of the hardware driver: returning
@@ -241,7 +281,11 @@ def _run_rosbridge(
         return
     state_pub = roslibpy.Topic(ros, args.state_topic, "sensor_msgs/msg/JointState")
     config_pub = roslibpy.Topic(ros, args.config_topic, "std_msgs/msg/String", latch=True)
-    command_sub = roslibpy.Topic(ros, args.command_topic, "sensor_msgs/msg/JointState")
+    command_sub = (
+        None
+        if read_only
+        else roslibpy.Topic(ros, args.command_topic, "sensor_msgs/msg/JointState")
+    )
     control_sub = roslibpy.Topic(ros, args.control_topic, "std_msgs/msg/String")
     bus_lock = threading.Lock()
     control_state: dict[str, Any] = {"torque_enabled": False, "last_error": ""}
@@ -257,6 +301,10 @@ def _run_rosbridge(
             "data": json.dumps(_config_payload(
                 joints,
                 torque_enabled=bool(control_state["torque_enabled"]),
+                commands_allowed=(
+                    bool(control_state["torque_enabled"])
+                    and not read_only
+                ),
                 last_error=str(control_state["last_error"]),
             ))
         }))
@@ -298,7 +346,8 @@ def _run_rosbridge(
 
     state_pub.advertise()
     config_pub.advertise()
-    command_sub.subscribe(apply_command_safely)
+    if command_sub is not None:
+        command_sub.subscribe(apply_command_safely)
     control_sub.subscribe(apply_control_safely)
     try:
         publish_config()
@@ -323,7 +372,8 @@ def _run_rosbridge(
             publish_state()
     finally:
         try:
-            command_sub.unsubscribe()
+            if command_sub is not None:
+                command_sub.unsubscribe()
             control_sub.unsubscribe()
             state_pub.unadvertise()
             config_pub.unadvertise()
@@ -587,6 +637,19 @@ def main() -> int:
     parser.add_argument("--command-topic", default="/joint_commands")
     parser.add_argument("--config-topic", default="/joint_config")
     parser.add_argument("--control-topic", default="/robot_control")
+    parser.add_argument(
+        "--node-name",
+        default="",
+        help=(
+            "ROS 2 node name override. By default the driver derives a stable "
+            "name from --state-topic, such as blacknode_feetech_bus_driver_follower."
+        ),
+    )
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="publish feedback and accept torque controls, but expose no joint-command subscriber",
+    )
     parser.add_argument("--rate-hz", type=float, default=60.0)
     parser.add_argument("--transport", choices=("native", "rosbridge"), default="native")
     parser.add_argument("--host", default="127.0.0.1", help="rosbridge host when --transport=rosbridge")
@@ -655,7 +718,10 @@ def main() -> int:
     DurabilityPolicy = imports["DurabilityPolicy"]
 
     rclpy.init(args=None)
-    node = rclpy.create_node("blacknode_feetech_bus_driver")
+    node = _create_ros_node(
+        rclpy,
+        ros_node_name(args.state_topic, args.node_name),
+    )
     state_pub = node.create_publisher(JointState, args.state_topic, 10)
     config_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
     config_pub = node.create_publisher(String, args.config_topic, config_qos)
@@ -683,6 +749,10 @@ def main() -> int:
         config_msg.data = json.dumps(_config_payload(
             joints,
             torque_enabled=bool(control_state["torque_enabled"]),
+            commands_allowed=(
+                bool(control_state["torque_enabled"])
+                and not bool(getattr(args, "read_only", False))
+            ),
             last_error=str(control_state["last_error"]),
         ))
         config_pub.publish(config_msg)
@@ -714,7 +784,8 @@ def main() -> int:
                 control_state["last_error"] = error
         publish_config()
 
-    node.create_subscription(JointState, args.command_topic, on_command, 10)
+    if not bool(getattr(args, "read_only", False)):
+        node.create_subscription(JointState, args.command_topic, on_command, 10)
     node.create_subscription(String, args.control_topic, on_control, 10)
 
     period = 1.0 / max(0.1, args.rate_hz)
