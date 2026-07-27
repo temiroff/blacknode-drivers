@@ -57,6 +57,8 @@ also publishes the same read-only joint and torque state to the runtime's local
 deployment telemetry bridge. This lets the editor monitor the robot after the
 deployment takes ownership of the serial bus. Outside a managed deployment the
 bridge is absent and the driver continues normally.
+Runtime 0.3.16 or newer also receives each configured joint's calibrated limits,
+allowing monitor charts to use a stable physical scale.
 
 ## Safety
 
