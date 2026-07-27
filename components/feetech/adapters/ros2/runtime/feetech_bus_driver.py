@@ -197,16 +197,37 @@ def _publish_deployment_state(
 ) -> None:
     if publisher is None:
         return
-    publisher.publish_robot_state(
-        {
-            name: ticks_to_degrees(ticks, joints[name])
-            for name, ticks in ticks_by_name.items()
-        },
-        torque_enabled=bool(control_state["torque_enabled"]),
-        connected=True,
-        position_unit="degree",
-        error=str(control_state["last_error"]),
-    )
+    positions = {
+        name: ticks_to_degrees(ticks, joints[name])
+        for name, ticks in ticks_by_name.items()
+    }
+    metadata = {
+        "torque_enabled": bool(control_state["torque_enabled"]),
+        "connected": True,
+        "position_unit": "degree",
+        "error": str(control_state["last_error"]),
+    }
+    try:
+        publisher.publish_robot_state(
+            positions,
+            **metadata,
+            joint_limits={
+                name: (
+                    min(joints[name].min_deg, joints[name].max_deg),
+                    max(joints[name].min_deg, joints[name].max_deg),
+                )
+                for name in positions
+            },
+        )
+    except TypeError as exc:
+        if "joint_limits" not in str(exc):
+            raise
+        # Runtime 0.3.15 and older do not accept joint limits yet. Continue
+        # publishing compatible telemetry until the managed Runtime is updated.
+        publisher.publish_robot_state(
+            positions,
+            **metadata,
+        )
 
 
 def _config_payload(

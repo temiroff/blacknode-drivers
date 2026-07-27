@@ -453,5 +453,50 @@ def test_deployed_driver_reports_read_only_joint_and_torque_telemetry():
             "connected": True,
             "position_unit": "degree",
             "error": "",
+            "joint_limits": {"shoulder": (-90.0, 90.0)},
         },
     )]
+
+
+def test_deployed_driver_keeps_publishing_with_legacy_runtime():
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "components"
+        / "feetech"
+        / "adapters"
+        / "ros2"
+        / "runtime"
+        / "feetech_bus_driver.py"
+    )
+    runtime = runpy.run_path(str(runtime_path))
+    joint = runtime["JointSpec"]("shoulder", 1, -90.0, 90.0)
+    published = []
+
+    class LegacyPublisher:
+        def publish_robot_state(
+            self,
+            positions,
+            *,
+            torque_enabled,
+            connected,
+            position_unit,
+            error,
+        ):
+            published.append((
+                positions,
+                torque_enabled,
+                connected,
+                position_unit,
+                error,
+            ))
+
+    runtime["_publish_deployment_state"](
+        LegacyPublisher(),
+        {"shoulder": 2048},
+        {"shoulder": joint},
+        {"torque_enabled": False, "last_error": ""},
+    )
+
+    assert published == [
+        ({"shoulder": 0.0}, False, True, "degree", ""),
+    ]
