@@ -66,6 +66,8 @@ bridge is absent and the driver continues normally.
   state. Support the robot because a previously holding arm may become limp.
 - Torque enable primitives read every joint, seed the current positions as
   goals while torque is off, and then enable torque.
+- Goal seeding retries the same current-position write and accepts a matching
+  register readback when a half-duplex acknowledgement is lost.
 - Any partial failure returns every configured joint to torque-off.
 - Commands are clamped to configured safe ranges at the bus boundary.
 - Physical torque and motion paths have not been exercised as part of routine

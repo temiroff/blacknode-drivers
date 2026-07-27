@@ -284,6 +284,78 @@ def test_driver_startup_disables_torque_before_reading_pose():
     ]
 
 
+def test_driver_goal_seed_accepts_readback_after_lost_write_ack():
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "components"
+        / "feetech"
+        / "adapters"
+        / "ros2"
+        / "runtime"
+        / "feetech_bus_driver.py"
+    )
+    runtime = runpy.run_path(str(runtime_path))
+    calls = []
+
+    class Packet:
+        def write2ByteTxRx(self, _port, servo_id, address, ticks):
+            calls.append(("write", servo_id, address, ticks))
+            return 1, 0
+
+        def read2ByteTxRx(self, _port, servo_id, address):
+            calls.append(("readback", servo_id, address))
+            return 2048, 0, 0
+
+    seeded = runtime["_write_goal"](
+        SimpleNamespace(COMM_SUCCESS=0),
+        Packet(),
+        object(),
+        5,
+        2048,
+        confirm=True,
+    )
+
+    assert seeded is True
+    assert calls == [
+        ("write", 5, runtime["ADDR_GOAL_POSITION"][0], 2048),
+        ("readback", 5, runtime["ADDR_GOAL_POSITION"][0]),
+    ]
+
+
+def test_driver_goal_seed_retries_then_fails_without_confirmation():
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "components"
+        / "feetech"
+        / "adapters"
+        / "ros2"
+        / "runtime"
+        / "feetech_bus_driver.py"
+    )
+    runtime = runpy.run_path(str(runtime_path))
+    writes = []
+
+    class Packet:
+        def write2ByteTxRx(self, _port, servo_id, _address, ticks):
+            writes.append((servo_id, ticks))
+            return 1, 0
+
+        def read2ByteTxRx(self, _port, _servo_id, _address):
+            return 1024, 0, 0
+
+    seeded = runtime["_write_goal"](
+        SimpleNamespace(COMM_SUCCESS=0),
+        Packet(),
+        object(),
+        5,
+        2048,
+        confirm=True,
+    )
+
+    assert seeded is False
+    assert writes == [(5, 2048), (5, 2048), (5, 2048)]
+
+
 def test_driver_ros_node_name_is_unique_per_robot_topic_namespace():
     runtime_path = (
         Path(__file__).resolve().parents[1]
