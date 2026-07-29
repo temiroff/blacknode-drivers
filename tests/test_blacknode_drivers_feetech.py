@@ -1,6 +1,7 @@
 import math
 import runpy
 from pathlib import Path
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -45,6 +46,7 @@ def test_feetech_ros2_adapter_resolves_layer_dependencies_and_stays_disarmed():
     plan = adapter_dependency_plan("blacknode-drivers", "feetech", "ros2")
     assert [(item["package"], item["component"], item.get("adapter", "")) for item in plan["plan"]] == [
         ("blacknode-drivers", "feetech", ""),
+        ("blacknode-robot", "contracts", ""),
         ("blacknode-ros2", "core", ""),
         ("blacknode-ros2", "rosbridge", ""),
         ("blacknode-drivers", "feetech", "ros2"),
@@ -180,6 +182,10 @@ def test_read_only_probe_never_calls_write_methods():
             calls.append(("read", servo_id, address))
             return 2048 + servo_id, 0, 0
 
+        def read4ByteTxRx(self, _port, servo_id, address):
+            calls.append(("diagnostics", servo_id, address))
+            return 74 | (30 << 8), 0, 0
+
     fake_sdk = SimpleNamespace(
         COMM_SUCCESS=0,
         PortHandler=lambda _name: Port(),
@@ -198,11 +204,19 @@ def test_read_only_probe_never_calls_write_methods():
 
     assert result["ok"] is True
     assert set(result["readings"]) == {"shoulder", "gripper"}
+    assert result["readings"]["shoulder"]["position_rad"] == pytest.approx(
+        math.radians(bus.ticks_to_degrees(2049, bus.JointSpec("shoulder", 1, -90, 90)))
+    )
+    assert result["readings"]["shoulder"]["voltage_v"] == 7.4
+    assert result["readings"]["shoulder"]["temperature_c"] == 30.0
+    assert result["diagnostics"]["serial_packet_error_count"] == 0
     assert calls == [
         "open",
         ("baud", 1_000_000),
         ("read", 1, bus.ADDR_PRESENT_POSITION[0]),
+        ("diagnostics", 1, bus.ADDR_PRESENT_VOLTAGE[0]),
         ("read", 6, bus.ADDR_PRESENT_POSITION[0]),
+        ("diagnostics", 6, bus.ADDR_PRESENT_VOLTAGE[0]),
         "close",
     ]
 
@@ -523,8 +537,8 @@ def test_deployed_driver_reports_read_only_joint_and_torque_telemetry():
     published = []
 
     class Publisher:
-        def publish_robot_state(self, positions, **metadata):
-            published.append((positions, metadata))
+        def publish_device_state(self, state):
+            published.append(state)
 
     runtime["_publish_deployment_state"](
         Publisher(),
@@ -533,19 +547,116 @@ def test_deployed_driver_reports_read_only_joint_and_torque_telemetry():
         {"torque_enabled": False, "last_error": ""},
     )
 
-    assert published == [(
-        {"shoulder": 0.0},
+    assert len(published) == 1
+    state = published[0]
+    assert state["kind"] == "blacknode.device-state"
+    assert state["connected"] is True
+    assert state["armed"] is False
+    assert state["torque_enabled"] is False
+    assert state["joint_state"]["kind"] == "blacknode.joint-state"
+    assert state["joint_state"]["positions"] == {"shoulder": 0.0}
+    assert state["joint_state"]["limits"]["shoulder"] == {
+        "lower": -math.pi / 2,
+        "upper": math.pi / 2,
+    }
+
+
+def test_instrumented_packet_counts_timeouts_and_servo_hardware_flags():
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "components"
+        / "feetech"
+        / "adapters"
+        / "ros2"
+        / "runtime"
+        / "feetech_bus_driver.py"
+    )
+    runtime = runpy.run_path(str(runtime_path))
+    sdk = SimpleNamespace(COMM_SUCCESS=0, COMM_RX_TIMEOUT=-6)
+
+    class Packet:
+        def read2ByteTxRx(self, _port, _servo_id, _address):
+            return 0, -6, 0
+
+        def write1ByteTxRx(self, _port, _servo_id, _address, _value):
+            return 0, 4
+
+    telemetry = runtime["BusTelemetry"]()
+    packet = runtime["InstrumentedPacket"](Packet(), sdk, telemetry)
+
+    packet.read2ByteTxRx(object(), 1, 56)
+    packet.write1ByteTxRx(object(), 2, 40, 1)
+
+    assert telemetry.operation_count == 2
+    assert telemetry.timeout_count == 1
+    assert telemetry.serial_packet_error_count == 1
+    assert telemetry.hardware_error_count == 1
+    assert telemetry.protocol_error_flags == {2: 4}
+
+
+def test_servo_diagnostics_are_normalized_into_canonical_device_state():
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "components"
+        / "feetech"
+        / "adapters"
+        / "ros2"
+        / "runtime"
+        / "feetech_bus_driver.py"
+    )
+    runtime = runpy.run_path(str(runtime_path))
+    sdk = SimpleNamespace(COMM_SUCCESS=0)
+    joint = runtime["JointSpec"]("shoulder", 1, -90.0, 90.0)
+    joints = {"shoulder": joint}
+    packed = 74 | (35 << 8) | (4 << 24)
+
+    class Packet:
+        def read4ByteTxRx(self, _port, servo_id, address):
+            assert servo_id == 1
+            assert address == runtime["ADDR_PRESENT_VOLTAGE"][0]
+            return packed, 0, 0
+
+    telemetry = runtime["BusTelemetry"]()
+    packet = runtime["InstrumentedPacket"](Packet(), sdk, telemetry)
+    runtime["_read_bus_diagnostics"](
+        sdk,
+        packet,
+        object(),
+        joints,
+        telemetry,
+    )
+    telemetry.last_full_feedback_time = time.time()
+    published = []
+
+    class Publisher:
+        def publish_device_state(self, state):
+            published.append(state)
+
+    runtime["_publish_deployment_state"](
+        Publisher(),
+        {"shoulder": 2048},
+        joints,
         {
             "torque_enabled": False,
-            "connected": True,
-            "position_unit": "degree",
-            "error": "",
-            "joint_limits": {"shoulder": (-90.0, 90.0)},
+            "last_error": "",
+            "stale_after": 0.25,
         },
-    )]
+        telemetry,
+    )
+
+    state = published[0]
+    assert state["kind"] == "blacknode.device-state"
+    assert state["connected"] is True
+    assert state["temperatures_c"] == {"shoulder": 35.0}
+    assert state["voltage_v"] == 7.4
+    assert state["values"]["bus"]["hardware_error_flags"] == {"shoulder": 4}
+    assert state["values"]["bus"]["hardware_errors"] == {
+        "shoulder": ["overheat"]
+    }
+    assert state["faults"][0]["code"] == "feetech-hardware-shoulder"
 
 
-def test_deployed_driver_keeps_publishing_with_legacy_runtime():
+def test_canonical_state_uses_last_complete_feedback_for_freshness():
     runtime_path = (
         Path(__file__).resolve().parents[1]
         / "components"
@@ -557,33 +668,30 @@ def test_deployed_driver_keeps_publishing_with_legacy_runtime():
     )
     runtime = runpy.run_path(str(runtime_path))
     joint = runtime["JointSpec"]("shoulder", 1, -90.0, 90.0)
+    telemetry = runtime["BusTelemetry"](
+        last_full_feedback_time=time.time() - 2.0
+    )
     published = []
 
-    class LegacyPublisher:
-        def publish_robot_state(
-            self,
-            positions,
-            *,
-            torque_enabled,
-            connected,
-            position_unit,
-            error,
-        ):
-            published.append((
-                positions,
-                torque_enabled,
-                connected,
-                position_unit,
-                error,
-            ))
+    class Publisher:
+        def publish_device_state(self, state):
+            published.append(state)
 
     runtime["_publish_deployment_state"](
-        LegacyPublisher(),
+        Publisher(),
         {"shoulder": 2048},
         {"shoulder": joint},
-        {"torque_enabled": False, "last_error": ""},
+        {
+            "torque_enabled": False,
+            "last_error": "",
+            "stale_after": 0.25,
+        },
+        telemetry,
     )
 
-    assert published == [
-        ({"shoulder": 0.0}, False, True, "degree", ""),
-    ]
+    state = published[0]
+    assert state["connected"] is False
+    assert state["joint_state"]["source_time"] == pytest.approx(
+        telemetry.last_full_feedback_time
+    )
+    assert any(fault["code"] == "feedback-timeout" for fault in state["faults"])

@@ -27,6 +27,11 @@ jobs:
         with:
           repository: temiroff/blacknode-ros2
           path: core/packages/blacknode-ros2
+      - name: Check out Robot contracts dependency
+        uses: actions/checkout@v6
+        with:
+          repository: temiroff/blacknode-robot
+          path: core/packages/blacknode-robot
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
@@ -36,6 +41,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ./core pytest
+          python -m pip install -e ./core/packages/blacknode-robot
           if [ -f package/requirements.txt ]; then
             python -m pip install -r package/requirements.txt
           fi

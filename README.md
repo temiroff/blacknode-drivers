@@ -55,6 +55,30 @@ ROS graph and transport behavior. The optional `ros2` adapter nested under
 `feetech` connects this driver to the ROS interface while hardware ownership
 stays inside the Feetech component.
 
+Driver feedback is normalized into
+`blacknode-robot/contracts` `JointState`, `DeviceState`, and `FaultState`
+before it reaches deployment telemetry, workflows, or safety consumers.
+ROS `sensor_msgs/msg/JointState` exists only at the nested ROS adapter boundary.
+Positions and calibrated limits are reported in radians. The Feetech runtime
+also reports per-servo temperature and voltage, active hardware-error flags,
+complete-feedback age, communication timeout count, serial packet-error count,
+and packet-error rate. These diagnostics are passive reads and never authorize
+motion.
+
+## Driver safety boundary
+
+Concrete drivers enforce the final hardware boundary:
+
+- communication timeout and stale-command suppression;
+- vendor fault, temperature, voltage, and serial packet-error reporting;
+- final calibrated-range clamping;
+- idempotent torque enable and disable;
+- torque disable during normal or fault shutdown.
+
+`blacknode-motion` independently enforces ownership, authorization, joint and
+velocity limits, and collision checks. A physical or firmware emergency stop
+remains the final independent layer.
+
 When the Feetech ROS 2 driver runs inside Blacknode Runtime 0.3.9 or newer, it
 also publishes the same read-only joint and torque state to the runtime's local
 deployment telemetry bridge. This lets the editor monitor the robot after the

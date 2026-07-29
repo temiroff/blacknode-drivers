@@ -1,6 +1,6 @@
 [package]
 name = "blacknode-drivers"
-version = "0.3.0"
+version = "0.4.0"
 description = "Physical hardware drivers and firmware adapters for Blacknode robots."
 requires-blacknode = ">=0.3.0"
 layer = "drivers"
@@ -34,5 +34,6 @@ node-types = ["FeetechROS2Adapter"]
 pip = ["roslibpy>=1.5"]
 imports = ["roslibpy"]
 requires = [
+  { package = "blacknode-robot", component = "contracts", version = ">=0.5.0,<1.0.0" },
   { package = "blacknode-ros2", component = "rosbridge", version = ">=0.5.8,<1.0.0" },
 ]

@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
-"""Feetech STS/SMS serial-bus servo driver -> Blacknode's native ROS 2 JointState contract.
+"""Feetech STS/SMS serial-bus servo driver with a ROS 2 adapter.
 
 Reusable across any Feetech-protocol robot, not just the SO-ARM101: pass a
 different --joints map for a different arm. This script adds no new safety
-logic of its own -- it publishes JointState on --state-topic, subscribes
-JointState on --command-topic, and publishes one latched JSON config message
-on --config-topic, exactly the contract already read by
-packages/blacknode-ros2/nodes/ros2_native_runtime.py and the arm controller
-ROS 2 adapter built on it (ROS2JointState / ROS2SetJoint / ROS2ManualMove in
-blacknode-motion). Those nodes already sync-before-move
-and clamp to the published limits; this script's own job is narrower: never
-let the servos jump when torque switches on, and never write outside a
-joint's calibrated range.
+logic of its own. It reports canonical Blacknode DeviceState telemetry and
+converts joint feedback to ROS ``sensor_msgs/msg/JointState`` at this adapter
+boundary. Its final driver safeguards prevent startup jumps and clamp every
+write to the calibrated range.
 
 Hardware imports (rclpy, scservo_sdk) are deferred out of module top-level so
 the pure parsing/math helpers below stay importable -- and unit-testable --
@@ -27,7 +22,7 @@ import signal
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 _TICKS_PER_REV = 4096          # STS3215: 12-bit single-turn position range (0-4095)
@@ -41,6 +36,230 @@ _DEFAULT_HOME_TICKS = 2048     # protocol mid-point; override per-joint with --h
 ADDR_TORQUE_ENABLE = (40, 1)
 ADDR_GOAL_POSITION = (42, 2)
 ADDR_PRESENT_POSITION = (56, 2)
+ADDR_PRESENT_VOLTAGE = (62, 1)
+ADDR_PRESENT_TEMPERATURE = (63, 1)
+ADDR_SERVO_STATUS = (65, 1)
+
+_HARDWARE_ERROR_BITS = {
+    0x01: "voltage",
+    0x02: "angle-sensor",
+    0x04: "overheat",
+    0x08: "overcurrent",
+    0x20: "overload",
+}
+
+
+def _decode_hardware_error_flags(flags: int) -> list[str]:
+    return [
+        name
+        for bit, name in _HARDWARE_ERROR_BITS.items()
+        if int(flags) & bit
+    ]
+
+
+@dataclass
+class BusTelemetry:
+    """Passive bus-health counters and low-rate servo diagnostics."""
+
+    operation_count: int = 0
+    timeout_count: int = 0
+    serial_packet_error_count: int = 0
+    exception_count: int = 0
+    hardware_error_count: int = 0
+    protocol_error_flags: dict[int, int] = field(default_factory=dict)
+    temperatures_c: dict[str, float] = field(default_factory=dict)
+    voltages_v: dict[str, float] = field(default_factory=dict)
+    status_registers: dict[str, int] = field(default_factory=dict)
+    last_full_feedback_time: float = 0.0
+    last_diagnostic_time: float = 0.0
+
+    def record_result(
+        self,
+        sdk: Any,
+        comm_result: Any,
+        servo_error: int = 0,
+        servo_id: int | None = None,
+    ) -> None:
+        self.operation_count += 1
+        if comm_result != sdk.COMM_SUCCESS:
+            self.serial_packet_error_count += 1
+            if comm_result == getattr(sdk, "COMM_RX_TIMEOUT", object()):
+                self.timeout_count += 1
+        if servo_id is not None and comm_result == sdk.COMM_SUCCESS:
+            flags = int(servo_error or 0)
+            self.protocol_error_flags[int(servo_id)] = flags
+            if flags:
+                self.hardware_error_count += 1
+
+    def record_exception(self) -> None:
+        self.operation_count += 1
+        self.serial_packet_error_count += 1
+        self.exception_count += 1
+
+    def snapshot(self, joints: dict[str, "JointSpec"]) -> dict[str, Any]:
+        hardware_flags = {
+            name: int(
+                self.protocol_error_flags.get(joint.servo_id, 0)
+                | self.status_registers.get(name, 0)
+            )
+            for name, joint in joints.items()
+        }
+        return {
+            "operation_count": self.operation_count,
+            "timeout_count": self.timeout_count,
+            "serial_packet_error_count": self.serial_packet_error_count,
+            "serial_packet_error_rate": (
+                self.serial_packet_error_count / self.operation_count
+                if self.operation_count
+                else 0.0
+            ),
+            "exception_count": self.exception_count,
+            "hardware_error_count": self.hardware_error_count,
+            "hardware_error_flags": hardware_flags,
+            "hardware_errors": {
+                name: _decode_hardware_error_flags(flags)
+                for name, flags in hardware_flags.items()
+                if flags
+            },
+            "servo_status": dict(self.status_registers),
+            "voltages_v": dict(self.voltages_v),
+            "last_full_feedback_time": self.last_full_feedback_time,
+            "last_diagnostic_time": self.last_diagnostic_time,
+        }
+
+
+class InstrumentedPacket:
+    """Record SDK communication outcomes without changing its packet API."""
+
+    def __init__(self, packet: Any, sdk: Any, telemetry: BusTelemetry) -> None:
+        self._packet = packet
+        self._sdk = sdk
+        self._telemetry = telemetry
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._packet, name)
+
+    def _tuple_call(
+        self,
+        method: str,
+        *args: Any,
+        servo_id: int | None = None,
+        comm_index: int,
+        error_index: int,
+    ) -> Any:
+        try:
+            result = getattr(self._packet, method)(*args)
+        except Exception:
+            self._telemetry.record_exception()
+            raise
+        self._telemetry.record_result(
+            self._sdk,
+            result[comm_index],
+            result[error_index],
+            servo_id,
+        )
+        return result
+
+    def read1ByteTxRx(self, port: Any, servo_id: int, address: int) -> Any:
+        return self._tuple_call(
+            "read1ByteTxRx",
+            port,
+            servo_id,
+            address,
+            servo_id=servo_id,
+            comm_index=1,
+            error_index=2,
+        )
+
+    def read2ByteTxRx(self, port: Any, servo_id: int, address: int) -> Any:
+        return self._tuple_call(
+            "read2ByteTxRx",
+            port,
+            servo_id,
+            address,
+            servo_id=servo_id,
+            comm_index=1,
+            error_index=2,
+        )
+
+    def read4ByteTxRx(self, port: Any, servo_id: int, address: int) -> Any:
+        return self._tuple_call(
+            "read4ByteTxRx",
+            port,
+            servo_id,
+            address,
+            servo_id=servo_id,
+            comm_index=1,
+            error_index=2,
+        )
+
+    def write1ByteTxRx(
+        self,
+        port: Any,
+        servo_id: int,
+        address: int,
+        value: int,
+    ) -> Any:
+        return self._tuple_call(
+            "write1ByteTxRx",
+            port,
+            servo_id,
+            address,
+            value,
+            servo_id=servo_id,
+            comm_index=0,
+            error_index=1,
+        )
+
+    def write2ByteTxRx(
+        self,
+        port: Any,
+        servo_id: int,
+        address: int,
+        value: int,
+    ) -> Any:
+        return self._tuple_call(
+            "write2ByteTxRx",
+            port,
+            servo_id,
+            address,
+            value,
+            servo_id=servo_id,
+            comm_index=0,
+            error_index=1,
+        )
+
+    def readRx(self, port: Any, servo_id: int, length: int) -> Any:
+        return self._tuple_call(
+            "readRx",
+            port,
+            servo_id,
+            length,
+            servo_id=servo_id,
+            comm_index=1,
+            error_index=2,
+        )
+
+    def _result_call(self, method: str, *args: Any) -> Any:
+        try:
+            result = getattr(self._packet, method)(*args)
+        except Exception:
+            self._telemetry.record_exception()
+            raise
+        self._telemetry.record_result(self._sdk, result)
+        return result
+
+    def syncReadTx(self, *args: Any) -> Any:
+        return self._result_call("syncReadTx", *args)
+
+    def syncWriteTxOnly(self, *args: Any) -> Any:
+        return self._result_call("syncWriteTxOnly", *args)
+
+    def write1ByteTxOnly(self, *args: Any) -> Any:
+        return self._result_call("write1ByteTxOnly", *args)
+
+    def write2ByteTxOnly(self, *args: Any) -> Any:
+        return self._result_call("write2ByteTxOnly", *args)
 
 
 def ros_node_name(state_topic: str, explicit_name: str = "") -> str:
@@ -194,40 +413,142 @@ def _publish_deployment_state(
     ticks_by_name: dict[str, int],
     joints: dict[str, JointSpec],
     control_state: dict[str, Any],
+    bus_telemetry: BusTelemetry | None = None,
 ) -> None:
     if publisher is None:
         return
+    from blacknode_robot.devices import DeviceState, FaultState, JointState
+
     positions = {
-        name: ticks_to_degrees(ticks, joints[name])
+        name: math.radians(ticks_to_degrees(ticks, joints[name]))
         for name, ticks in ticks_by_name.items()
     }
-    metadata = {
-        "torque_enabled": bool(control_state["torque_enabled"]),
-        "connected": True,
-        "position_unit": "degree",
-        "error": str(control_state["last_error"]),
-    }
-    try:
-        publisher.publish_robot_state(
-            positions,
-            **metadata,
-            joint_limits={
+    error = str(control_state["last_error"])
+    receive_time = time.time()
+    source_time = (
+        float(bus_telemetry.last_full_feedback_time)
+        if bus_telemetry is not None and bus_telemetry.last_full_feedback_time
+        else receive_time
+    )
+    stale_after = max(0.05, float(control_state.get("stale_after") or 0.75))
+    feedback_age = max(0.0, receive_time - source_time)
+    connected = feedback_age <= stale_after
+    metrics = bus_telemetry.snapshot(joints) if bus_telemetry is not None else {}
+    faults: list[Any] = []
+    if error:
+        faults.append(
+            FaultState(
+                code="driver-error",
+                message=error,
+                source_time=receive_time,
+            )
+        )
+    if not connected:
+        faults.append(
+            FaultState(
+                code="feedback-timeout",
+                message=(
+                    f"complete joint feedback is {feedback_age:.3f}s old "
+                    f"(limit {stale_after:.3f}s)"
+                ),
+                severity="critical",
+                source_time=receive_time,
+                details={
+                    "feedback_age_seconds": feedback_age,
+                    "stale_after_seconds": stale_after,
+                },
+            )
+        )
+    for name, flags in metrics.get("hardware_error_flags", {}).items():
+        if not flags:
+            continue
+        faults.append(
+            FaultState(
+                code=f"feetech-hardware-{name}",
+                message=(
+                    f"{name} reports hardware flags 0x{int(flags):02x}: "
+                    + ", ".join(_decode_hardware_error_flags(int(flags)))
+                ),
+                severity="critical",
+                source_time=receive_time,
+                details={
+                    "joint": name,
+                    "flags": int(flags),
+                    "decoded": _decode_hardware_error_flags(int(flags)),
+                },
+            )
+        )
+    state = DeviceState(
+        device_id=str(control_state.get("device_id") or "feetech"),
+        connected=connected,
+        armed=bool(control_state["torque_enabled"]),
+        torque_enabled=bool(control_state["torque_enabled"]),
+        capabilities=[
+            "joint_group",
+            "position_feedback",
+            "temperature_feedback",
+            "voltage_feedback",
+            "bus_health",
+        ],
+        joint_state=JointState(
+            positions=positions,
+            limits={
                 name: (
-                    min(joints[name].min_deg, joints[name].max_deg),
-                    max(joints[name].min_deg, joints[name].max_deg),
+                    math.radians(min(joints[name].min_deg, joints[name].max_deg)),
+                    math.radians(max(joints[name].min_deg, joints[name].max_deg)),
                 )
                 for name in positions
             },
-        )
-    except TypeError as exc:
-        if "joint_limits" not in str(exc):
-            raise
-        # Runtime 0.3.15 and older do not accept joint limits yet. Continue
-        # publishing compatible telemetry until the managed Runtime is updated.
-        publisher.publish_robot_state(
-            positions,
-            **metadata,
-        )
+            source_time=source_time,
+            receive_time=receive_time,
+        ),
+        faults=faults,
+        temperatures_c=(
+            dict(bus_telemetry.temperatures_c)
+            if bus_telemetry is not None
+            else {}
+        ),
+        voltage_v=(
+            min(bus_telemetry.voltages_v.values())
+            if bus_telemetry is not None and bus_telemetry.voltages_v
+            else None
+        ),
+        values={
+            "feedback_age_seconds": feedback_age,
+            "stale_after_seconds": stale_after,
+            "bus": metrics,
+        },
+        error=error,
+        updated_at=receive_time,
+    )
+    publisher.publish_device_state(state.as_dict())
+
+
+def _read_bus_diagnostics(
+    sdk: Any,
+    packet: Any,
+    port: Any,
+    joints: dict[str, JointSpec],
+    telemetry: BusTelemetry,
+) -> None:
+    """Read voltage, temperature, and status with one packet per servo."""
+    start_address, _width = ADDR_PRESENT_VOLTAGE
+    for name, joint in joints.items():
+        try:
+            packed, comm_result, _servo_error = packet.read4ByteTxRx(
+                port,
+                joint.servo_id,
+                start_address,
+            )
+        except Exception:
+            continue
+        if comm_result != sdk.COMM_SUCCESS:
+            continue
+        raw = int(packed)
+        telemetry.voltages_v[name] = float(raw & 0xFF) / 10.0
+        telemetry.temperatures_c[name] = float((raw >> 8) & 0xFF)
+        telemetry.status_registers[name] = int((raw >> 24) & 0xFF)
+    telemetry.last_diagnostic_time = time.time()
 
 
 def _config_payload(
@@ -283,6 +604,7 @@ def _run_rosbridge(
     port: Any,
     current_ticks: dict[str, int],
     stop_event: threading.Event,
+    bus_telemetry: BusTelemetry,
 ) -> None:
     roslibpy = imports["roslibpy"]
     read_only = bool(getattr(args, "read_only", False))
@@ -309,13 +631,24 @@ def _run_rosbridge(
     )
     control_sub = roslibpy.Topic(ros, args.control_topic, "std_msgs/msg/String")
     bus_lock = threading.Lock()
-    control_state: dict[str, Any] = {"torque_enabled": False, "last_error": ""}
+    control_state: dict[str, Any] = {
+        "torque_enabled": False,
+        "last_error": "",
+        "stale_after": max(0.25, 3.0 / max(0.1, args.rate_hz)),
+    }
     last_known_ticks = dict(current_ticks)
+    bus_telemetry.last_full_feedback_time = time.time()
     telemetry = _deployment_telemetry_publisher()
 
     def publish_state() -> None:
         state_pub.publish(roslibpy.Message(_joint_state_payload(last_known_ticks, joints)))
-        _publish_deployment_state(telemetry, last_known_ticks, joints, control_state)
+        _publish_deployment_state(
+            telemetry,
+            last_known_ticks,
+            joints,
+            control_state,
+            bus_telemetry,
+        )
 
     def publish_config() -> None:
         config_pub.publish(roslibpy.Message({
@@ -375,6 +708,7 @@ def _run_rosbridge(
         publish_state()
         period = 1.0 / max(0.1, args.rate_hz)
         was_connected = True
+        last_diagnostic = 0.0
         while not stop_event.wait(period):
             if not ros.is_connected:
                 was_connected = False
@@ -389,7 +723,20 @@ def _run_rosbridge(
                 publish_state()
                 was_connected = True
             with bus_lock:
-                last_known_ticks.update(_sync_read_positions(sdk, packet, port, joints))
+                readings = _sync_read_positions(sdk, packet, port, joints)
+                last_known_ticks.update(readings)
+                if len(readings) == len(joints):
+                    bus_telemetry.last_full_feedback_time = time.time()
+                now = time.monotonic()
+                if now - last_diagnostic >= 1.0:
+                    _read_bus_diagnostics(
+                        sdk,
+                        packet,
+                        port,
+                        joints,
+                        bus_telemetry,
+                    )
+                    last_diagnostic = now
             publish_state()
     finally:
         try:
@@ -677,7 +1024,8 @@ def _dry_run(sdk: Any, joints: dict[str, JointSpec], port_name: str, baudrate: i
     touches Goal_Position or Torque_Enable. Use this to validate wiring and
     the control-table addresses above before any write is ever attempted."""
     port = _open_port(sdk, port_name, baudrate)
-    packet = sdk.PacketHandler(0)
+    bus_telemetry = BusTelemetry()
+    packet = InstrumentedPacket(sdk.PacketHandler(0), sdk, bus_telemetry)
 
     readings = []
     for joint in joints.values():
@@ -689,11 +1037,27 @@ def _dry_run(sdk: Any, joints: dict[str, JointSpec], port_name: str, baudrate: i
             "servo_id": joint.servo_id,
             "ok": ok,
             "ticks": int(ticks) if ok else None,
-            "degrees": ticks_to_degrees(int(ticks), joint) if ok else None,
+            "radians": (
+                math.radians(ticks_to_degrees(int(ticks), joint))
+                if ok
+                else None
+            ),
             "comm_result": packet.getTxRxResult(comm_result) if comm_result != sdk.COMM_SUCCESS else "COMM_SUCCESS",
         })
+    _read_bus_diagnostics(sdk, packet, port, joints, bus_telemetry)
     port.closePort()
-    print(json.dumps({"ok": all(r["ok"] for r in readings), "readings": readings}, indent=2))
+    print(
+        json.dumps(
+            {
+                "ok": all(r["ok"] for r in readings),
+                "readings": readings,
+                "diagnostics": bus_telemetry.snapshot(joints),
+                "temperatures_c": dict(bus_telemetry.temperatures_c),
+                "voltages_v": dict(bus_telemetry.voltages_v),
+            },
+            indent=2,
+        )
+    )
     return 0 if all(r["ok"] for r in readings) else 1
 
 
@@ -749,7 +1113,8 @@ def main() -> int:
         return _dry_run(sdk, joints, args.port, args.baudrate)
 
     port = _open_port(sdk, args.port, args.baudrate)
-    packet = sdk.PacketHandler(0)
+    bus_telemetry = BusTelemetry()
+    packet = InstrumentedPacket(sdk.PacketHandler(0), sdk, bus_telemetry)
 
     # Driver startup is always disarmed. Holding torque is enabled only by the
     # explicit ``exit_teach`` control path, which first seeds every goal from
@@ -773,7 +1138,17 @@ def main() -> int:
 
     if args.transport == "rosbridge":
         try:
-            _run_rosbridge(args, imports, joints, sdk, packet, port, current_ticks, stop_event)
+            _run_rosbridge(
+                args,
+                imports,
+                joints,
+                sdk,
+                packet,
+                port,
+                current_ticks,
+                stop_event,
+                bus_telemetry,
+            )
         finally:
             if args.torque_off_on_exit:
                 for joint in joints.values():
@@ -796,7 +1171,12 @@ def main() -> int:
     state_pub = node.create_publisher(JointState, args.state_topic, 10)
     config_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
     config_pub = node.create_publisher(String, args.config_topic, config_qos)
-    control_state: dict[str, Any] = {"torque_enabled": False, "last_error": ""}
+    control_state: dict[str, Any] = {
+        "torque_enabled": False,
+        "last_error": "",
+        "stale_after": max(0.25, 3.0 / max(0.1, args.rate_hz)),
+    }
+    bus_telemetry.last_full_feedback_time = time.time()
     bus_lock = threading.Lock()
     telemetry = _deployment_telemetry_publisher()
 
@@ -808,7 +1188,13 @@ def main() -> int:
         msg.velocity = []
         msg.effort = []
         state_pub.publish(msg)
-        _publish_deployment_state(telemetry, ticks_by_name, joints, control_state)
+        _publish_deployment_state(
+            telemetry,
+            ticks_by_name,
+            joints,
+            control_state,
+            bus_telemetry,
+        )
 
     # First /joint_states publish is the just-seeded pose (real hardware
     # position), so ROS2SetJoint's "sync to current pose" has a real
@@ -863,13 +1249,26 @@ def main() -> int:
     last_known_ticks = dict(current_ticks)
     try:
         last_publish = 0.0
+        last_diagnostic = 0.0
         while rclpy.ok() and not stop_event.is_set():
             rclpy.spin_once(node, timeout_sec=min(0.05, period))
             now = time.monotonic()
             if now - last_publish >= period:
                 last_publish = now
                 with bus_lock:
-                    last_known_ticks.update(_sync_read_positions(sdk, packet, port, joints))
+                    readings = _sync_read_positions(sdk, packet, port, joints)
+                    last_known_ticks.update(readings)
+                    if len(readings) == len(joints):
+                        bus_telemetry.last_full_feedback_time = time.time()
+                    if now - last_diagnostic >= 1.0:
+                        _read_bus_diagnostics(
+                            sdk,
+                            packet,
+                            port,
+                            joints,
+                            bus_telemetry,
+                        )
+                        last_diagnostic = now
                 publish_state(last_known_ticks)
     finally:
         if args.torque_off_on_exit:

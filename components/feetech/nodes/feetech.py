@@ -83,13 +83,19 @@ def feetech_bus_config(ctx: dict) -> dict:
         "config": Dict,
         "confirm_read_only": Bool(default=False),
     },
-    outputs={"connected": Bool, "readings": Dict, "report": Text},
+    outputs={
+        "connected": Bool,
+        "readings": Dict,
+        "diagnostics": Dict,
+        "report": Text,
+    },
 )
 def feetech_bus_probe(ctx: dict) -> dict:
     if not bool(ctx.get("confirm_read_only")):
         return {
             "connected": False,
             "readings": {},
+            "diagnostics": {},
             "report": "Feetech probe BLOCKED: enable confirm_read_only after checking port, power, and wiring",
         }
     config = ctx.get("config") if isinstance(ctx.get("config"), Mapping) else {}
@@ -99,14 +105,22 @@ def feetech_bus_probe(ctx: dict) -> dict:
         return {
             "connected": False,
             "readings": {},
+            "diagnostics": {},
             "report": f"Feetech read-only probe failed: {type(exc).__name__}: {exc}",
         }
     errors = result.get("errors") or []
     report = f"Feetech read-only probe received {len(result['readings'])} joint position(s)"
+    diagnostics = result.get("diagnostics") or {}
+    report += (
+        f"; timeouts={diagnostics.get('timeout_count', 0)}, "
+        f"packet_errors={diagnostics.get('serial_packet_error_count', 0)}, "
+        f"hardware_errors={diagnostics.get('hardware_error_count', 0)}"
+    )
     if errors:
         report += "\n" + "\n".join(f"- {error}" for error in errors)
     return {
         "connected": bool(result.get("ok")),
         "readings": result.get("readings") or {},
+        "diagnostics": diagnostics,
         "report": report,
     }
