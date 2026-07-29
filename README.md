@@ -70,6 +70,8 @@ allowing monitor charts to use a stable physical scale.
   goals while torque is off, and then enable torque.
 - Goal seeding retries the same current-position write and accepts a matching
   register readback when a half-duplex acknowledgement is lost.
+- Torque changes retry after communication loss and require either a successful
+  write acknowledgement or a matching torque-register readback.
 - Any partial failure returns every configured joint to torque-off.
 - Commands are clamped to configured safe ranges at the bus boundary.
 - Physical torque and motion paths have not been exercised as part of routine
