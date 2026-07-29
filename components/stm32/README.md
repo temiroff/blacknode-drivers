@@ -1,16 +1,9 @@
-# Stm32
+# STM32
 
-Component of `blacknode-drivers`.
+Design notes for a future concrete firmware-bridge driver family.
 
-Node sources for this component belong in this folder. Until they move here,
-nodes claim the component inline:
+STM32 is not a public package component yet. Serial, CAN, or USB helpers used
+by an STM32 bridge belong under `internal/transports/`.
 
-    @node(name="MyNode", component="stm32", ...)
-
-Once sources live here, declare the folder in `blacknode-package.toml`:
-
-    [components.stm32]
-    nodes = ["components/stm32/nodes"]
-
-and the inline `component=` argument can be dropped — the loader infers it
-from the directory.
+Add it to `blacknode-package.toml` when driver nodes, firmware protocol,
+safeguards, actionable unavailable-state reporting, and tests are implemented.

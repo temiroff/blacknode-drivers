@@ -6,9 +6,9 @@ different --joints map for a different arm. This script adds no new safety
 logic of its own -- it publishes JointState on --state-topic, subscribes
 JointState on --command-topic, and publishes one latched JSON config message
 on --config-topic, exactly the contract already read by
-packages/blacknode-ros2/nodes/ros2_native_runtime.py and the joint-control
+packages/blacknode-ros2/nodes/ros2_native_runtime.py and the arm controller
 ROS 2 adapter built on it (ROS2JointState / ROS2SetJoint / ROS2ManualMove in
-blacknode-controllers). Those nodes already sync-before-move
+blacknode-motion). Those nodes already sync-before-move
 and clamp to the published limits; this script's own job is narrower: never
 let the servos jump when torque switches on, and never write outside a
 joint's calibrated range.

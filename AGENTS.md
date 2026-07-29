@@ -8,7 +8,7 @@ commit its Git state separately from the Blacknode core checkout.
 Keep physical bus protocols, vendor SDK adapters, firmware bridges, hardware
 probes, and last-boundary motion safeguards here. Keep robot profiles and
 calibration ownership in `blacknode-robot`, generic controllers in
-`blacknode-controllers`, and ROS graph/transport behavior in `blacknode-ros2`.
+`blacknode-motion`, and ROS graph/transport behavior in `blacknode-ros2`.
 
 ## Safety rules
 
@@ -27,6 +27,13 @@ calibration ownership in `blacknode-robot`, generic controllers in
 
 ## Development rules
 
+- Public components represent concrete device or firmware driver families.
+  Keep serial, CAN, USB, and other communication mechanisms private under
+  `internal/transports/`; do not expose them as selectable components.
+- Add a new driver component only with a real implementation, dependencies,
+  safeguards, tests, and actionable unavailable-state reporting. Do not add
+  generic buckets such as motor controllers, sensor drivers, or vendor
+  adapters.
 - Components are selectively loaded through `blacknode-package.toml`; keep
   optional vendor imports out of module top level.
 - A hardware component may expose transport-neutral configuration and runtime
