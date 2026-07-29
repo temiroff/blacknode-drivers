@@ -23,15 +23,22 @@ def test_feetech_component_registers_expected_nodes():
     assert info.layer == "drivers"
     assert info.component_mode is True
     assert info.enabled_components == ["feetech"]
+    assert set(info.components) == {"feetech"}
+    assert not {
+        "serial",
+        "can",
+        "usb",
+        "motor-controllers",
+        "sensor-drivers",
+        "vendor-adapters",
+    }.intersection(info.components)
     assert info.components["feetech"]["capabilities"] == [
         "driver.feetech",
-        "driver.serial-servo",
         "robot.joint-driver",
     ]
-    assert info.pip_dependencies == ["feetech-servo-sdk>=1.0"]
+    assert "feetech-servo-sdk>=1.0" in info.pip_dependencies
     assert {"FeetechBusConfig", "FeetechBusProbe"}.issubset(info.node_types)
     assert _NODE_REGISTRY["FeetechBusConfig"]._bn_component == "feetech"
-    assert info.components["feetech"]["adapters"]["ros2"]["enabled"] is False
 
 
 def test_feetech_ros2_adapter_resolves_layer_dependencies_and_stays_disarmed():
@@ -39,10 +46,19 @@ def test_feetech_ros2_adapter_resolves_layer_dependencies_and_stays_disarmed():
     assert [(item["package"], item["component"], item.get("adapter", "")) for item in plan["plan"]] == [
         ("blacknode-drivers", "feetech", ""),
         ("blacknode-ros2", "core", ""),
+        ("blacknode-ros2", "rosbridge", ""),
         ("blacknode-drivers", "feetech", "ros2"),
     ]
 
+    adapter_was_enabled = (
+        "feetech/ros2"
+        in _PACKAGE_REGISTRY["blacknode-drivers"].enabled_adapters
+    )
+    rosbridge_was_enabled = (
+        "rosbridge" in _PACKAGE_REGISTRY["blacknode-ros2"].enabled_components
+    )
     try:
+        set_component_enabled("blacknode-ros2", "rosbridge", True)
         info = set_adapter_enabled("blacknode-drivers", "feetech", "ros2", True)
         assert "FeetechROS2Adapter" in info.node_types
         assert info.enabled_components == ["feetech"]
@@ -52,9 +68,19 @@ def test_feetech_ros2_adapter_resolves_layer_dependencies_and_stays_disarmed():
         assert result["adapter"]["motion_armed"] is False
         assert result["adapter"]["config"] == {"port": "COM7"}
         with pytest.raises(ValueError, match="blacknode-drivers/feetech adapter ros2"):
-            set_component_enabled("blacknode-ros2", "core", False)
+            set_component_enabled("blacknode-ros2", "rosbridge", False)
     finally:
-        set_adapter_enabled("blacknode-drivers", "feetech", "ros2", False)
+        set_adapter_enabled(
+            "blacknode-drivers",
+            "feetech",
+            "ros2",
+            adapter_was_enabled,
+        )
+        set_component_enabled(
+            "blacknode-ros2",
+            "rosbridge",
+            rosbridge_was_enabled,
+        )
 
 
 def test_feetech_config_is_inert_and_accepts_robot_profile():

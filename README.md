@@ -1,11 +1,10 @@
 # blacknode-drivers
 
-Physical drivers are selectable components. `feetech` owns its transport-
-neutral bus contract, safeguards, runtimes, and optional adapters. Its nested
-`ros2` adapter depends on `blacknode-ros2/core`; enabling that adapter resolves
-the ROS dependency while the component remains simply `feetech`.
-
-Physical hardware-driver components for Blacknode robotics workflows.
+Physical drivers are selectable components named after the device or firmware
+family they control. `feetech` owns its bus contract, safeguards, runtimes, and
+optional adapters. Its nested `ros2` adapter depends on
+`blacknode-ros2/core`; enabling that adapter resolves the ROS dependency while
+the component remains simply `feetech`.
 
 This layer repository groups independently selectable vendor and firmware
 adapters. Installing the repository makes its component catalog available;
@@ -16,10 +15,14 @@ Blacknode loads nodes and dependencies only for enabled components.
 | Component | Status | Capability |
 |---|---|---|
 | `feetech` | Available | Feetech STS/SMS bus configuration, read-only probing, and torque-safe bus primitives |
-| `stm32` | Planned | STM32 firmware bridge |
-| `serial` | Planned | Generic serial hardware helpers |
-| `can` | Planned | CAN bus adapters |
-| `vendor-adapters` | Planned | Additional physical hardware SDK adapters |
+
+Feetech is currently the only public driver component. STM32, DaMiao,
+CubeMars, and RealSense become selectable components when their usable driver
+code, dependencies, safeguards, unavailable-state reporting, and tests exist.
+
+Serial, CAN, and USB are internal transport mechanisms rather than selectable
+components. Shared transport helpers belong under `internal/transports/` and
+are consumed by an implemented concrete driver such as `feetech`.
 
 The Feetech component is enabled by default while this is the repository's
 first component. Manage it explicitly with:
@@ -45,12 +48,12 @@ the SDK or attached servos.
 
 ## Ownership boundary
 
-`blacknode-drivers` owns physical protocol access and final driver-boundary
-safeguards. `blacknode-robot` owns robot models, profiles, calibration, and
-capability contracts. `blacknode-ros2` owns ROS graph and transport behavior.
-The optional `ros2` adapter nested under `feetech` connects this bus
-implementation to the ROS interface while hardware ownership stays inside the
-Feetech component.
+`blacknode-drivers` owns concrete physical drivers, their internal protocol
+access, and final driver-boundary safeguards. `blacknode-robot` owns robot
+models, profiles, calibration, and capability contracts. `blacknode-ros2` owns
+ROS graph and transport behavior. The optional `ros2` adapter nested under
+`feetech` connects this driver to the ROS interface while hardware ownership
+stays inside the Feetech component.
 
 When the Feetech ROS 2 driver runs inside Blacknode Runtime 0.3.9 or newer, it
 also publishes the same read-only joint and torque state to the runtime's local
