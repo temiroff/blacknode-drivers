@@ -15,6 +15,15 @@ DEFAULT_HOME_TICKS = 2048
 ADDR_TORQUE_ENABLE = (40, 1)
 ADDR_GOAL_POSITION = (42, 2)
 ADDR_PRESENT_POSITION = (56, 2)
+ADDR_PRESENT_VOLTAGE = (62, 1)
+
+_HARDWARE_ERROR_BITS = {
+    0x01: "voltage",
+    0x02: "angle-sensor",
+    0x04: "overheat",
+    0x08: "overcurrent",
+    0x20: "overload",
+}
 
 
 @dataclass(frozen=True)
@@ -149,6 +158,10 @@ def ticks_to_degrees(ticks: int, joint: JointSpec) -> float:
     return -degrees if joint.invert else degrees
 
 
+def ticks_to_radians(ticks: int, joint: JointSpec) -> float:
+    return math.radians(ticks_to_degrees(ticks, joint))
+
+
 def degrees_to_ticks(degrees: float, joint: JointSpec) -> int:
     signed = -float(degrees) if joint.invert else float(degrees)
     ticks = joint.home_ticks + round(signed * TICKS_PER_REV / 360.0)
@@ -199,30 +212,114 @@ def read_position_or_none(sdk: Any, packet: Any, port: Any, servo_id: int) -> in
 
 
 def probe_bus(config: Mapping[str, Any], sdk: Any | None = None) -> dict[str, Any]:
-    """Read present positions only; this function performs no register writes."""
+    """Read position and health registers without performing any writes."""
     joints = joints_from_config(config)
     hardware_sdk = sdk or load_sdk()
     port = open_port(hardware_sdk, str(config.get("port") or ""), int(config.get("baudrate") or 1_000_000))
     packet = hardware_sdk.PacketHandler(0)
     readings: dict[str, dict[str, Any]] = {}
     errors: list[str] = []
+    counters = {
+        "operation_count": 0,
+        "timeout_count": 0,
+        "serial_packet_error_count": 0,
+        "hardware_error_count": 0,
+    }
+
+    def record(comm_result: Any, servo_error: int) -> None:
+        counters["operation_count"] += 1
+        if comm_result != hardware_sdk.COMM_SUCCESS:
+            counters["serial_packet_error_count"] += 1
+            if comm_result == getattr(hardware_sdk, "COMM_RX_TIMEOUT", object()):
+                counters["timeout_count"] += 1
+        if servo_error:
+            counters["hardware_error_count"] += 1
+
     try:
         for name, joint in joints.items():
-            ticks = read_position_or_none(hardware_sdk, packet, port, joint.servo_id)
-            if ticks is None:
+            address, _width = ADDR_PRESENT_POSITION
+            try:
+                ticks, comm_result, position_error = packet.read2ByteTxRx(
+                    port,
+                    joint.servo_id,
+                    address,
+                )
+            except Exception:
+                counters["operation_count"] += 1
+                counters["serial_packet_error_count"] += 1
+                errors.append(
+                    f"no valid Present_Position response from {name} "
+                    f"(servo {joint.servo_id})"
+                )
+                continue
+            record(comm_result, position_error)
+            if comm_result != hardware_sdk.COMM_SUCCESS:
                 errors.append(f"no valid Present_Position response from {name} (servo {joint.servo_id})")
                 continue
+            packed = 0
+            diagnostic_error = 0
+            try:
+                packed, diagnostic_result, diagnostic_error = packet.read4ByteTxRx(
+                    port,
+                    joint.servo_id,
+                    ADDR_PRESENT_VOLTAGE[0],
+                )
+                record(diagnostic_result, diagnostic_error)
+            except Exception:
+                diagnostic_result = None
+                counters["operation_count"] += 1
+                counters["serial_packet_error_count"] += 1
+            status = int((int(packed) >> 24) & 0xFF) if diagnostic_result == hardware_sdk.COMM_SUCCESS else 0
+            hardware_flags = int(position_error or 0) | int(diagnostic_error or 0) | status
+            if status:
+                counters["hardware_error_count"] += 1
+            if diagnostic_result != hardware_sdk.COMM_SUCCESS:
+                errors.append(
+                    f"no valid voltage/temperature/status response from {name} "
+                    f"(servo {joint.servo_id})"
+                )
+            if hardware_flags:
+                errors.append(
+                    f"{name} (servo {joint.servo_id}) reports hardware flags "
+                    f"0x{hardware_flags:02x}"
+                )
             readings[name] = {
                 "servo_id": joint.servo_id,
-                "ticks": ticks,
-                "degrees": ticks_to_degrees(ticks, joint),
+                "ticks": int(ticks),
+                "position_rad": ticks_to_radians(int(ticks), joint),
+                "voltage_v": (
+                    float(int(packed) & 0xFF) / 10.0
+                    if diagnostic_result == hardware_sdk.COMM_SUCCESS
+                    else None
+                ),
+                "temperature_c": (
+                    float((int(packed) >> 8) & 0xFF)
+                    if diagnostic_result == hardware_sdk.COMM_SUCCESS
+                    else None
+                ),
+                "hardware_error_flags": hardware_flags,
+                "hardware_errors": [
+                    label
+                    for bit, label in _HARDWARE_ERROR_BITS.items()
+                    if hardware_flags & bit
+                ],
             }
     finally:
         try:
             port.closePort()
         except Exception:
             pass
-    return {"ok": not errors, "readings": readings, "errors": errors}
+    counters["serial_packet_error_rate"] = (
+        counters["serial_packet_error_count"] / counters["operation_count"]
+        if counters["operation_count"]
+        else 0.0
+    )
+    return {
+        "ok": not errors,
+        "readings": readings,
+        "diagnostics": counters,
+        "errors": errors,
+    }
 
 
 def _write_goal(sdk: Any, packet: Any, port: Any, servo_id: int, ticks: int) -> bool:
