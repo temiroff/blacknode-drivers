@@ -322,6 +322,67 @@ def test_driver_goal_seed_accepts_readback_after_lost_write_ack():
     ]
 
 
+def test_driver_torque_accepts_readback_after_lost_write_ack():
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "components"
+        / "feetech"
+        / "adapters"
+        / "ros2"
+        / "runtime"
+        / "feetech_bus_driver.py"
+    )
+    runtime = runpy.run_path(str(runtime_path))
+    calls = []
+
+    class Packet:
+        def write1ByteTxRx(self, _port, servo_id, address, enabled):
+            calls.append(("write", servo_id, address, enabled))
+            return 1, 0
+
+        def read1ByteTxRx(self, _port, servo_id, address):
+            calls.append(("readback", servo_id, address))
+            return 1, 0, 0
+
+    enabled = runtime["_set_torque"](
+        SimpleNamespace(COMM_SUCCESS=0),
+        Packet(),
+        object(),
+        3,
+        True,
+    )
+
+    assert enabled is True
+    assert calls == [
+        ("write", 3, runtime["ADDR_TORQUE_ENABLE"][0], 1),
+        ("readback", 3, runtime["ADDR_TORQUE_ENABLE"][0]),
+    ]
+
+
+def test_torque_change_does_not_mask_a_servo_reported_error():
+    calls = []
+
+    class Packet:
+        def write1ByteTxRx(self, _port, servo_id, _address, enabled):
+            calls.append(("write", servo_id, enabled))
+            return 0, 4
+
+        def read1ByteTxRx(self, *_args):
+            calls.append(("readback",))
+            return 1, 0, 0
+
+    enabled = bus._set_torque(
+        SimpleNamespace(COMM_SUCCESS=0),
+        Packet(),
+        object(),
+        3,
+        True,
+    )
+
+    assert enabled is False
+    assert calls == [("write", 3, 1)]
+
+
 def test_driver_goal_seed_retries_then_fails_without_confirmation():
     runtime_path = (
         Path(__file__).resolve().parents[1]

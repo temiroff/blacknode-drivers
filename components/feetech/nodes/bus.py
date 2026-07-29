@@ -236,13 +236,31 @@ def _write_goal(sdk: Any, packet: Any, port: Any, servo_id: int, ticks: int) -> 
 
 def _set_torque(sdk: Any, packet: Any, port: Any, servo_id: int, enabled: bool) -> bool:
     address, _width = ADDR_TORQUE_ENABLE
-    try:
-        comm_result, servo_error = packet.write1ByteTxRx(
-            port, servo_id, address, 1 if enabled else 0
-        )
-    except Exception:
-        return False
-    return comm_result == sdk.COMM_SUCCESS and servo_error == 0
+    desired = 1 if enabled else 0
+    for _attempt in range(2):
+        try:
+            comm_result, servo_error = packet.write1ByteTxRx(
+                port, servo_id, address, desired
+            )
+        except Exception:
+            comm_result, servo_error = None, None
+        if comm_result == sdk.COMM_SUCCESS and servo_error == 0:
+            return True
+        if servo_error not in (None, 0):
+            return False
+        try:
+            confirmed, read_result, read_error = packet.read1ByteTxRx(
+                port, servo_id, address
+            )
+        except Exception:
+            continue
+        if (
+            read_result == sdk.COMM_SUCCESS
+            and read_error == 0
+            and int(confirmed) == desired
+        ):
+            return True
+    return False
 
 
 def disable_all_torque(
