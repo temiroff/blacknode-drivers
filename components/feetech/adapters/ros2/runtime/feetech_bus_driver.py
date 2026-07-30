@@ -516,6 +516,14 @@ def _publish_deployment_state(
         values={
             "feedback_age_seconds": feedback_age,
             "stale_after_seconds": stale_after,
+            "servo_ids": {
+                name: joints[name].servo_id
+                for name in positions
+            },
+            "raw_positions": {
+                name: int(ticks_by_name[name])
+                for name in positions
+            },
             "bus": metrics,
         },
         error=error,

@@ -559,6 +559,8 @@ def test_deployed_driver_reports_read_only_joint_and_torque_telemetry():
         "lower": -math.pi / 2,
         "upper": math.pi / 2,
     }
+    assert state["values"]["servo_ids"] == {"shoulder": 1}
+    assert state["values"]["raw_positions"] == {"shoulder": 2048}
 
 
 def test_instrumented_packet_counts_timeouts_and_servo_hardware_flags():
