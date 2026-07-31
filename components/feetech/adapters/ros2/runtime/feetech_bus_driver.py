@@ -462,19 +462,41 @@ def _publish_deployment_state(
     for name, flags in metrics.get("hardware_error_flags", {}).items():
         if not flags:
             continue
+        decoded = _decode_hardware_error_flags(int(flags))
+        voltage = metrics.get("voltages_v", {}).get(name)
+        voltage_hint = (
+            (
+                f"; measured input {float(voltage):.1f} V. "
+                "Check that the connected power supply matches this robot "
+                "and servo voltage rating."
+            )
+            if (
+                "voltage" in decoded
+                and isinstance(voltage, (int, float))
+                and not isinstance(voltage, bool)
+            )
+            else ""
+        )
         faults.append(
             FaultState(
                 code=f"feetech-hardware-{name}",
                 message=(
                     f"{name} reports hardware flags 0x{int(flags):02x}: "
-                    + ", ".join(_decode_hardware_error_flags(int(flags)))
+                    + ", ".join(decoded)
+                    + voltage_hint
                 ),
                 severity="critical",
                 source_time=receive_time,
                 details={
                     "joint": name,
                     "flags": int(flags),
-                    "decoded": _decode_hardware_error_flags(int(flags)),
+                    "decoded": decoded,
+                    "measured_voltage_v": (
+                        float(voltage)
+                        if isinstance(voltage, (int, float))
+                        and not isinstance(voltage, bool)
+                        else None
+                    ),
                 },
             )
         )
@@ -763,13 +785,26 @@ def _read_position(sdk: Any, packet: Any, port: Any, servo_id: int) -> int:
     """Strict read used only during startup seeding: any failure here means
     the safety sequence cannot proceed, so it aborts the whole process rather
     than risk enabling torque against an unknown position."""
-    ticks = _read_position_or_none(sdk, packet, port, servo_id)
+    ticks = _read_position_or_none(
+        sdk,
+        packet,
+        port,
+        servo_id,
+        accept_hardware_warning=False,
+    )
     if ticks is None:
         _fail(f"could not read Present_Position for servo id {servo_id}")
     return ticks
 
 
-def _read_position_or_none(sdk: Any, packet: Any, port: Any, servo_id: int) -> int | None:
+def _read_position_or_none(
+    sdk: Any,
+    packet: Any,
+    port: Any,
+    servo_id: int,
+    *,
+    accept_hardware_warning: bool = False,
+) -> int | None:
     """Best-effort read used by the steady-state publish loop: a transient
     bus error on one poll should not take down an otherwise-healthy driver
     process, so this returns None instead of exiting."""
@@ -781,9 +816,17 @@ def _read_position_or_none(sdk: Any, packet: Any, port: Any, servo_id: int) -> i
         # than the protocol header promised. Treat malformed/transient packets
         # exactly like COMM_RX_CORRUPT and retain the last valid joint value.
         return None
-    if comm_result != sdk.COMM_SUCCESS or servo_error != 0:
+    if comm_result != sdk.COMM_SUCCESS:
         return None
-    return int(ticks)
+    if servo_error != 0 and not accept_hardware_warning:
+        return None
+    try:
+        ticks_value = int(ticks)
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= ticks_value < _TICKS_PER_REV:
+        return None
+    return ticks_value
 
 
 def _sync_read_positions(
@@ -802,7 +845,15 @@ def _sync_read_positions(
         return {
             name: ticks
             for name, joint in joints.items()
-            if (ticks := _read_position_or_none(sdk, packet, port, joint.servo_id)) is not None
+            if (
+                ticks := _read_position_or_none(
+                    sdk,
+                    packet,
+                    port,
+                    joint.servo_id,
+                    accept_hardware_warning=True,
+                )
+            ) is not None
         }
     address, width = ADDR_PRESENT_POSITION
     group = group_type(port, packet, address, width)
@@ -947,7 +998,13 @@ def _prepare_released_startup(
         return False, {}, release_error
     current_ticks: dict[str, int] = {}
     for name, joint in joints.items():
-        ticks = _read_position_or_none(sdk, packet, port, joint.servo_id)
+        ticks = _read_position_or_none(
+            sdk,
+            packet,
+            port,
+            joint.servo_id,
+            accept_hardware_warning=True,
+        )
         if ticks is None:
             _disable_all_torque(sdk, packet, port, joints)
             return (

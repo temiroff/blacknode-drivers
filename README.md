@@ -41,6 +41,19 @@ blacknode packages disable blacknode-drivers feetech
   string.
 - `FeetechBusProbe` performs an explicitly confirmed, read-only position probe.
   It never writes goal position or torque registers.
+- The hidden `FeetechCalibrationProvider` implements the normalized calibration
+  session contract used by `blacknode-robot`'s generic
+  `RobotCalibrationControl` node. It owns the serial bus, verifies torque
+  release, reads joint positions, and seeds the current pose before Hold.
+  The same provider implements the generic joint-motion session used by the
+  on-node `RobotServo` Arm control, including post-command health and torque
+  verification.
+  Workflows select it through profile capability bindings rather than naming
+  this hardware family on the graph.
+- The hidden `FeetechRawMonitorProvider` supplies bounded, read-only servo-ID
+  discovery to the generic robot monitor contract. It reports raw ticks,
+  torque state, voltage, temperature, and hardware warnings. It never writes
+  torque or goal registers.
 
 The component keeps `scservo_sdk` imports deferred until a probe or hardware
 runtime is invoked, so package discovery works on development machines without
@@ -63,7 +76,14 @@ Positions and calibrated limits are reported in radians. The Feetech runtime
 also reports per-servo temperature and voltage, active hardware-error flags,
 complete-feedback age, communication timeout count, serial packet-error count,
 and packet-error rate. These diagnostics are passive reads and never authorize
-motion.
+motion. A valid position response remains present in read-only monitoring when
+the same packet carries a hardware warning. The warning remains active and
+visible, while torque-enable safety checks continue to require a warning-free
+read. Torque release accepts a warning-bearing write acknowledgement only when
+the physical torque-enable register subsequently reads back off. Voltage
+warnings include the measured input and direct the operator to verify that the
+connected supply matches the robot and servo voltage rating before enabling
+torque.
 
 ## Driver safety boundary
 
@@ -99,6 +119,8 @@ allowing monitor charts to use a stable physical scale.
   register readback when a half-duplex acknowledgement is lost.
 - Torque changes retry after communication loss and require either a successful
   write acknowledgement or a matching torque-register readback.
+- Guided calibration records samples only after every configured joint reports
+  torque disabled; unknown or mixed torque state blocks downstream recording.
 - Any partial failure returns every configured joint to torque-off.
 - Commands are clamped to configured safe ranges at the bus boundary.
 - Physical torque and motion paths have not been exercised as part of routine
