@@ -15,6 +15,7 @@ from blacknode.packages import (
     set_component_enabled,
 )
 from blacknode.pkg.blacknode_drivers.feetech import bus
+from blacknode.pkg.blacknode_drivers.feetech import calibration
 
 
 def test_feetech_component_registers_expected_nodes():
@@ -35,11 +36,32 @@ def test_feetech_component_registers_expected_nodes():
     }.intersection(info.components)
     assert info.components["feetech"]["capabilities"] == [
         "driver.feetech",
+        "robot.calibration-control",
         "robot.joint-driver",
+        "robot.joint-motion-provider",
+        "robot.raw-position-feedback",
     ]
     assert "feetech-servo-sdk>=1.0" in info.pip_dependencies
-    assert {"FeetechBusConfig", "FeetechBusProbe"}.issubset(info.node_types)
+    assert {
+        "FeetechBusConfig",
+        "FeetechBusProbe",
+        "FeetechCalibrationProvider",
+        "FeetechRawMonitorProvider",
+    }.issubset(info.node_types)
     assert _NODE_REGISTRY["FeetechBusConfig"]._bn_component == "feetech"
+    provider = _NODE_REGISTRY["FeetechCalibrationProvider"]
+    assert provider._bn_component == "feetech"
+    assert provider._bn_hidden is True
+    assert provider._bn_robot_calibration_provider["package"] == "blacknode-drivers"
+    assert provider._bn_robot_calibration_provider["component"] == "feetech"
+    assert provider._bn_robot_joint_motion_provider["package"] == "blacknode-drivers"
+    assert provider._bn_robot_joint_motion_provider["component"] == "feetech"
+    raw_provider = _NODE_REGISTRY["FeetechRawMonitorProvider"]
+    assert raw_provider._bn_hidden is True
+    assert (
+        raw_provider._bn_robot_raw_monitor_provider["capability"]
+        == "raw_position_feedback"
+    )
 
 
 def test_feetech_ros2_adapter_resolves_layer_dependencies_and_stays_disarmed():
@@ -138,6 +160,122 @@ def test_feetech_probe_requires_explicit_confirmation(monkeypatch):
     assert "BLOCKED" in result["report"]
 
 
+def test_feetech_calibration_provider_opens_normalized_session(monkeypatch):
+    captured = []
+
+    class FakeSession:
+        def __init__(self, config):
+            captured.append(config)
+
+    monkeypatch.setattr(calibration, "FeetechCalibrationSession", FakeSession)
+    provider = _NODE_REGISTRY[
+        "FeetechCalibrationProvider"
+    ]._bn_robot_calibration_provider
+    session = provider["open_session"]({
+        "profile": {
+            "id": "test_arm",
+            "driver": {"baudrate": 1_000_000},
+            "joints": [{
+                "id": "shoulder",
+                "servo_id": 1,
+                "safe_min_deg": -90,
+                "safe_max_deg": 90,
+            }],
+        },
+        "hardware": {"recommended": {"path": "COM7"}},
+    })
+
+    assert isinstance(session, FakeSession)
+    assert captured[0]["port"] == "COM7"
+    assert captured[0]["profile_id"] == "test_arm"
+    assert list(captured[0]["joints"]) == ["shoulder"]
+
+
+def test_feetech_calibration_provider_rejects_missing_hardware():
+    provider = _NODE_REGISTRY[
+        "FeetechCalibrationProvider"
+    ]._bn_robot_calibration_provider
+
+    with pytest.raises(ValueError, match="select a connected robot serial port"):
+        provider["open_session"]({
+            "profile": {
+                "id": "test_arm",
+                "joints": [{
+                    "id": "shoulder",
+                    "servo_id": 1,
+                    "safe_min_deg": -90,
+                    "safe_max_deg": 90,
+                }],
+            },
+            "hardware": {},
+        })
+
+
+def test_monitor_only_calibration_close_does_not_change_torque(monkeypatch):
+    torque_writes = []
+    closed = []
+    hardware_bus = calibration.FeetechCalibrationSession.__new__(
+        calibration.FeetechCalibrationSession
+    )
+    hardware_bus.sdk = object()
+    hardware_bus.packet = object()
+    hardware_bus.port = SimpleNamespace(closePort=lambda: closed.append(True))
+    hardware_bus.joints = {"shoulder": object()}
+    hardware_bus._torque_touched = False
+    monkeypatch.setattr(
+        bus,
+        "disable_all_torque",
+        lambda *_args: torque_writes.append(True) or (True, ""),
+    )
+
+    hardware_bus.close()
+
+    assert closed == [True]
+    assert torque_writes == []
+
+
+def test_feetech_motion_command_requires_armed_healthy_session(monkeypatch):
+    writes = []
+    hardware_bus = calibration.FeetechCalibrationSession.__new__(
+        calibration.FeetechCalibrationSession
+    )
+    hardware_bus.sdk = object()
+    hardware_bus.packet = object()
+    hardware_bus.port = object()
+    hardware_bus.joints = {"shoulder": object()}
+    hardware_bus._armed = True
+    hardware_bus._torque_touched = True
+    healthy = {
+        "pose": {"shoulder": 0.0},
+        "torque_enabled": True,
+        "errors": [],
+        "warnings": [],
+    }
+    monkeypatch.setattr(hardware_bus, "sample", lambda: dict(healthy))
+    monkeypatch.setattr(
+        bus,
+        "write_joint_positions",
+        lambda _sdk, _packet, _port, _joints, positions: (
+            writes.append(dict(positions)) or True,
+            "",
+        ),
+    )
+
+    result = hardware_bus.command(
+        {"shoulder": 12.5},
+        deadline=time.monotonic() + 1.0,
+    )
+
+    assert result["torque_enabled"] is True
+    assert writes == [{"shoulder": 12.5}]
+    hardware_bus._armed = False
+    with pytest.raises(PermissionError, match="disarmed"):
+        hardware_bus.command(
+            {"shoulder": 0.0},
+            deadline=time.monotonic() + 1.0,
+        )
+
+
 def test_joint_parsing_conversion_and_validation():
     joints = bus.parse_joint_map(
         "shoulder:1:-90:90,gripper:6:-10:80",
@@ -219,6 +357,69 @@ def test_read_only_probe_never_calls_write_methods():
         ("diagnostics", 6, bus.ADDR_PRESENT_VOLTAGE[0]),
         "close",
     ]
+
+
+def test_raw_probe_discovers_responding_ids_without_writes():
+    calls = []
+
+    class Port:
+        def openPort(self):
+            calls.append("open")
+            return True
+
+        def setBaudRate(self, baudrate):
+            calls.append(("baud", baudrate))
+            return True
+
+        def closePort(self):
+            calls.append("close")
+
+    class Packet:
+        def read2ByteTxRx(self, _port, servo_id, address):
+            calls.append(("position", servo_id, address))
+            if servo_id not in {1, 6}:
+                return 0, -1, 0
+            return 2000 + servo_id, 0, 0
+
+        def read1ByteTxRx(self, _port, servo_id, address):
+            calls.append(("torque", servo_id, address))
+            return 0, 0, 0
+
+        def read4ByteTxRx(self, _port, servo_id, address):
+            calls.append(("diagnostics", servo_id, address))
+            return 120 | (31 << 8), 0, 0
+
+        def __getattr__(self, name):
+            if name.startswith("write"):
+                raise AssertionError(f"raw probe attempted {name}")
+            raise AttributeError(name)
+
+    fake_sdk = SimpleNamespace(
+        COMM_SUCCESS=0,
+        COMM_RX_TIMEOUT=-1,
+        PortHandler=lambda _name: Port(),
+        PacketHandler=lambda _protocol: Packet(),
+    )
+
+    result = bus.probe_raw_servos({
+        "port": "COM7",
+        "baudrate": 1_000_000,
+        "max_servo_id": 6,
+        "discovering": True,
+    }, sdk=fake_sdk)
+
+    assert result["ok"] is True
+    assert [joint["servo_id"] for joint in result["joints"]] == [1, 6]
+    assert result["joints"][1]["raw_position"] == 2006
+    assert result["joints"][0]["voltage_v"] == 12.0
+    assert result["joints"][0]["temperature_c"] == 31.0
+    assert result["torque_enabled"] is False
+    assert result["diagnostics"]["scan_miss_count"] == 4
+    assert result["diagnostics"]["serial_packet_error_count"] == 0
+    assert not any(
+        isinstance(call, tuple) and str(call[0]).startswith("write")
+        for call in calls
+    )
 
 
 def test_torque_enable_reads_and_seeds_every_joint_before_holding():
@@ -423,6 +624,80 @@ def test_torque_change_does_not_mask_a_servo_reported_error():
     assert calls == [("write", 3, 1)]
 
 
+def test_torque_release_accepts_confirmed_off_with_hardware_warning():
+    calls = []
+
+    class Packet:
+        def write1ByteTxRx(self, _port, servo_id, _address, enabled):
+            calls.append(("write", servo_id, enabled))
+            return 0, 1
+
+        def read1ByteTxRx(self, _port, servo_id, _address):
+            calls.append(("readback", servo_id))
+            return 0, 0, 1
+
+    released = bus._set_torque(
+        SimpleNamespace(COMM_SUCCESS=0),
+        Packet(),
+        object(),
+        2,
+        False,
+    )
+
+    assert released is True
+    assert calls == [("write", 2, 0), ("readback", 2)]
+
+
+def test_calibration_sample_preserves_warning_bearing_servo_feedback():
+    joint = bus.JointSpec("shoulder_lift", 2, -100.0, 100.0)
+
+    class Packet:
+        def read2ByteTxRx(self, _port, servo_id, address):
+            assert (servo_id, address) == (2, bus.ADDR_PRESENT_POSITION[0])
+            return 833, 0, 1
+
+        def read1ByteTxRx(self, _port, servo_id, address):
+            assert (servo_id, address) == (2, bus.ADDR_TORQUE_ENABLE[0])
+            return 0, 0, 1
+
+        def read4ByteTxRx(self, _port, servo_id, address):
+            assert (servo_id, address) == (2, bus.ADDR_PRESENT_VOLTAGE[0])
+            return 119 | (32 << 8) | (1 << 24), 0, 1
+
+    session = calibration.FeetechCalibrationSession.__new__(
+        calibration.FeetechCalibrationSession
+    )
+    session.sdk = SimpleNamespace(COMM_SUCCESS=0)
+    session.packet = Packet()
+    session.port = object()
+    session.joints = {"shoulder_lift": joint}
+
+    sample = session.sample()
+
+    assert sample["pose"]["shoulder_lift"] == pytest.approx(
+        bus.ticks_to_degrees(833, joint)
+    )
+    assert sample["torque_enabled"] is False
+    assert sample["errors"] == []
+    assert sample["warnings"] == [
+        "shoulder_lift (servo 2) hardware warning 0x01: voltage; "
+        "measured input 11.9 V. Check that the connected power supply "
+        "matches this robot and servo voltage rating."
+    ]
+    assert sample["servos"]["shoulder_lift"] == {
+        "servo_id": 2,
+        "communication_ok": True,
+        "ticks": 833,
+        "position_deg": pytest.approx(bus.ticks_to_degrees(833, joint)),
+        "torque_enabled": False,
+        "voltage_v": 11.9,
+        "temperature_c": 32.0,
+        "servo_status": 1,
+        "hardware_error_flags": 1,
+        "hardware_errors": ["voltage"],
+    }
+
+
 def test_driver_goal_seed_retries_then_fails_without_confirmation():
     runtime_path = (
         Path(__file__).resolve().parents[1]
@@ -594,6 +869,37 @@ def test_instrumented_packet_counts_timeouts_and_servo_hardware_flags():
     assert telemetry.serial_packet_error_count == 1
     assert telemetry.hardware_error_count == 1
     assert telemetry.protocol_error_flags == {2: 4}
+
+
+def test_monitoring_position_read_keeps_valid_ticks_with_hardware_warning():
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "components"
+        / "feetech"
+        / "adapters"
+        / "ros2"
+        / "runtime"
+        / "feetech_bus_driver.py"
+    )
+    runtime = runpy.run_path(str(runtime_path))
+    sdk = SimpleNamespace(COMM_SUCCESS=0)
+    packet = SimpleNamespace(
+        read2ByteTxRx=lambda _port, _servo_id, _address: (833, 0, 1)
+    )
+
+    assert runtime["_read_position_or_none"](
+        sdk,
+        packet,
+        object(),
+        2,
+    ) is None
+    assert runtime["_read_position_or_none"](
+        sdk,
+        packet,
+        object(),
+        2,
+        accept_hardware_warning=True,
+    ) == 833
 
 
 def test_servo_diagnostics_are_normalized_into_canonical_device_state():

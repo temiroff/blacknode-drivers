@@ -200,15 +200,110 @@ def open_port(sdk: Any, port_name: str, baudrate: int) -> Any:
     return port
 
 
-def read_position_or_none(sdk: Any, packet: Any, port: Any, servo_id: int) -> int | None:
+def decode_hardware_errors(flags: int) -> list[str]:
+    return [
+        label
+        for bit, label in _HARDWARE_ERROR_BITS.items()
+        if int(flags) & bit
+    ]
+
+
+def read_position_status(
+    sdk: Any,
+    packet: Any,
+    port: Any,
+    servo_id: int,
+) -> tuple[int | None, int]:
+    """Return valid position data separately from servo hardware flags."""
     address, _width = ADDR_PRESENT_POSITION
     try:
         ticks, comm_result, servo_error = packet.read2ByteTxRx(port, servo_id, address)
     except Exception:
+        return None, 0
+    if comm_result != sdk.COMM_SUCCESS:
+        return None, int(servo_error or 0)
+    try:
+        ticks_value = int(ticks)
+    except (TypeError, ValueError):
+        return None, int(servo_error or 0)
+    if not 0 <= ticks_value < TICKS_PER_REV:
+        return None, int(servo_error or 0)
+    return ticks_value, int(servo_error or 0)
+
+
+def read_position_or_none(sdk: Any, packet: Any, port: Any, servo_id: int) -> int | None:
+    ticks, hardware_flags = read_position_status(
+        sdk,
+        packet,
+        port,
+        servo_id,
+    )
+    return ticks if hardware_flags == 0 else None
+
+
+def read_torque_enabled_status(
+    sdk: Any,
+    packet: Any,
+    port: Any,
+    servo_id: int,
+) -> tuple[bool | None, int]:
+    """Return the physical torque bit separately from servo hardware flags."""
+    address, _width = ADDR_TORQUE_ENABLE
+    try:
+        value, comm_result, servo_error = packet.read1ByteTxRx(
+            port,
+            servo_id,
+            address,
+        )
+    except Exception:
+        return None, 0
+    if comm_result != sdk.COMM_SUCCESS:
+        return None, int(servo_error or 0)
+    return bool(value), int(servo_error or 0)
+
+
+def read_torque_enabled_or_none(
+    sdk: Any,
+    packet: Any,
+    port: Any,
+    servo_id: int,
+) -> bool | None:
+    enabled, hardware_flags = read_torque_enabled_status(
+        sdk,
+        packet,
+        port,
+        servo_id,
+    )
+    return enabled if hardware_flags == 0 else None
+
+
+def read_servo_diagnostics(
+    sdk: Any,
+    packet: Any,
+    port: Any,
+    servo_id: int,
+) -> dict[str, Any] | None:
+    """Read voltage, temperature, and status without changing servo state."""
+    try:
+        packed, comm_result, servo_error = packet.read4ByteTxRx(
+            port,
+            servo_id,
+            ADDR_PRESENT_VOLTAGE[0],
+        )
+    except Exception:
         return None
-    if comm_result != sdk.COMM_SUCCESS or servo_error != 0:
+    if comm_result != sdk.COMM_SUCCESS:
         return None
-    return int(ticks)
+    raw = int(packed)
+    status = int((raw >> 24) & 0xFF)
+    flags = int(servo_error or 0) | status
+    return {
+        "voltage_v": float(raw & 0xFF) / 10.0,
+        "temperature_c": float((raw >> 8) & 0xFF),
+        "servo_status": status,
+        "hardware_error_flags": flags,
+        "hardware_errors": decode_hardware_errors(flags),
+    }
 
 
 def probe_bus(config: Mapping[str, Any], sdk: Any | None = None) -> dict[str, Any]:
@@ -298,11 +393,7 @@ def probe_bus(config: Mapping[str, Any], sdk: Any | None = None) -> dict[str, An
                     else None
                 ),
                 "hardware_error_flags": hardware_flags,
-                "hardware_errors": [
-                    label
-                    for bit, label in _HARDWARE_ERROR_BITS.items()
-                    if hardware_flags & bit
-                ],
+                "hardware_errors": decode_hardware_errors(hardware_flags),
             }
     finally:
         try:
@@ -319,6 +410,207 @@ def probe_bus(config: Mapping[str, Any], sdk: Any | None = None) -> dict[str, An
         "readings": readings,
         "diagnostics": counters,
         "errors": errors,
+    }
+
+
+def probe_raw_servos(
+    config: Mapping[str, Any],
+    sdk: Any | None = None,
+) -> dict[str, Any]:
+    """Discover and sample servo IDs with reads only and no profile assumptions."""
+    hardware_sdk = sdk or load_sdk()
+    port = open_port(
+        hardware_sdk,
+        str(config.get("port") or ""),
+        int(config.get("baudrate") or 1_000_000),
+    )
+    packet = hardware_sdk.PacketHandler(0)
+    configured_ids = config.get("servo_ids")
+    if isinstance(configured_ids, (list, tuple, set)):
+        parsed_ids: set[int] = set()
+        for value in configured_ids:
+            try:
+                servo_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= servo_id <= 253:
+                parsed_ids.add(servo_id)
+        servo_ids = sorted(parsed_ids)
+    else:
+        maximum = max(1, min(253, int(config.get("max_servo_id") or 32)))
+        servo_ids = list(range(1, maximum + 1))
+    discovering = bool(config.get("discovering", configured_ids is None))
+    readings: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    errors: list[str] = []
+    torque_states: list[bool] = []
+    counters = {
+        "operation_count": 0,
+        "scan_miss_count": 0,
+        "timeout_count": 0,
+        "serial_packet_error_count": 0,
+        "hardware_error_count": 0,
+    }
+
+    def failed_operation(comm_result: Any, *, scan_miss: bool = False) -> None:
+        counters["operation_count"] += 1
+        if scan_miss:
+            counters["scan_miss_count"] += 1
+            return
+        counters["serial_packet_error_count"] += 1
+        if comm_result == getattr(hardware_sdk, "COMM_RX_TIMEOUT", object()):
+            counters["timeout_count"] += 1
+
+    try:
+        for servo_id in servo_ids:
+            try:
+                ticks, comm_result, position_flags = packet.read2ByteTxRx(
+                    port,
+                    servo_id,
+                    ADDR_PRESENT_POSITION[0],
+                )
+            except Exception:
+                failed_operation(None, scan_miss=discovering)
+                continue
+            if comm_result != hardware_sdk.COMM_SUCCESS:
+                failed_operation(comm_result, scan_miss=discovering)
+                continue
+            counters["operation_count"] += 1
+            try:
+                ticks_value = int(ticks)
+            except (TypeError, ValueError):
+                counters["serial_packet_error_count"] += 1
+                continue
+            if not 0 <= ticks_value < TICKS_PER_REV:
+                counters["serial_packet_error_count"] += 1
+                continue
+
+            torque_enabled: bool | None = None
+            torque_flags = 0
+            try:
+                raw_torque, torque_result, torque_flags = packet.read1ByteTxRx(
+                    port,
+                    servo_id,
+                    ADDR_TORQUE_ENABLE[0],
+                )
+                counters["operation_count"] += 1
+                if torque_result == hardware_sdk.COMM_SUCCESS:
+                    torque_enabled = bool(raw_torque)
+                    torque_states.append(torque_enabled)
+                else:
+                    counters["serial_packet_error_count"] += 1
+                    if torque_result == getattr(
+                        hardware_sdk,
+                        "COMM_RX_TIMEOUT",
+                        object(),
+                    ):
+                        counters["timeout_count"] += 1
+            except Exception:
+                counters["operation_count"] += 1
+                counters["serial_packet_error_count"] += 1
+
+            diagnostics: dict[str, Any] = {}
+            try:
+                packed, diagnostic_result, diagnostic_flags = (
+                    packet.read4ByteTxRx(
+                        port,
+                        servo_id,
+                        ADDR_PRESENT_VOLTAGE[0],
+                    )
+                )
+                counters["operation_count"] += 1
+                if diagnostic_result == hardware_sdk.COMM_SUCCESS:
+                    raw = int(packed)
+                    status = int((raw >> 24) & 0xFF)
+                    diagnostics = {
+                        "voltage_v": float(raw & 0xFF) / 10.0,
+                        "temperature_c": float((raw >> 8) & 0xFF),
+                        "servo_status": status,
+                        "hardware_error_flags": int(diagnostic_flags or 0)
+                        | status,
+                    }
+                else:
+                    counters["serial_packet_error_count"] += 1
+                    if diagnostic_result == getattr(
+                        hardware_sdk,
+                        "COMM_RX_TIMEOUT",
+                        object(),
+                    ):
+                        counters["timeout_count"] += 1
+            except Exception:
+                counters["operation_count"] += 1
+                counters["serial_packet_error_count"] += 1
+
+            hardware_flags = (
+                int(position_flags or 0)
+                | int(torque_flags or 0)
+                | int(diagnostics.get("hardware_error_flags") or 0)
+            )
+            hardware_errors = decode_hardware_errors(hardware_flags)
+            if hardware_flags:
+                counters["hardware_error_count"] += 1
+                warning = (
+                    f"servo_{servo_id} (servo {servo_id}) hardware warning "
+                    f"0x{hardware_flags:02x}: "
+                    + (", ".join(hardware_errors) or "vendor status")
+                )
+                voltage = diagnostics.get("voltage_v")
+                if (
+                    "voltage" in hardware_errors
+                    and isinstance(voltage, (int, float))
+                    and not isinstance(voltage, bool)
+                ):
+                    warning += (
+                        f"; measured input {float(voltage):.1f} V. "
+                        "Check that the connected power supply matches the "
+                        "servo voltage rating."
+                    )
+                warnings.append(warning)
+            readings.append({
+                "name": f"servo_{servo_id}",
+                "semantic_name": f"Servo {servo_id}",
+                "servo_id": servo_id,
+                "position": float(ticks_value),
+                "velocity": 0.0,
+                "raw_position": ticks_value,
+                "communication_ok": True,
+                "torque_enabled": torque_enabled,
+                "voltage_v": diagnostics.get("voltage_v"),
+                "temperature_c": diagnostics.get("temperature_c"),
+                "servo_status": diagnostics.get("servo_status"),
+                "hardware_error_flags": hardware_flags,
+                "hardware_errors": hardware_errors,
+            })
+    finally:
+        try:
+            port.closePort()
+        except Exception:
+            pass
+
+    if not readings:
+        errors.append(
+            "no responding Feetech servos were found in the read-only scan"
+        )
+    counters["serial_packet_error_rate"] = (
+        counters["serial_packet_error_count"] / counters["operation_count"]
+        if counters["operation_count"]
+        else 0.0
+    )
+    torque_enabled: bool | None = (
+        torque_states[0]
+        if torque_states and len(torque_states) == len(readings)
+        and len(set(torque_states)) == 1
+        else None
+    )
+    return {
+        "ok": bool(readings),
+        "joints": readings,
+        "position_unit": "ticks",
+        "velocity_unit": "ticks/s",
+        "torque_enabled": torque_enabled,
+        "warnings": warnings,
+        "errors": errors,
+        "diagnostics": counters,
     }
 
 
@@ -343,7 +635,10 @@ def _set_torque(sdk: Any, packet: Any, port: Any, servo_id: int, enabled: bool) 
             comm_result, servo_error = None, None
         if comm_result == sdk.COMM_SUCCESS and servo_error == 0:
             return True
-        if servo_error not in (None, 0):
+        # A servo hardware warning does not prove a torque-off write failed.
+        # Read the physical register back and accept only confirmed zero.
+        # Enabling torque remains strict: any warning blocks authorization.
+        if enabled and servo_error not in (None, 0):
             return False
         try:
             confirmed, read_result, read_error = packet.read1ByteTxRx(
@@ -353,8 +648,8 @@ def _set_torque(sdk: Any, packet: Any, port: Any, servo_id: int, enabled: bool) 
             continue
         if (
             read_result == sdk.COMM_SUCCESS
-            and read_error == 0
             and int(confirmed) == desired
+            and (read_error == 0 or not enabled)
         ):
             return True
     return False
