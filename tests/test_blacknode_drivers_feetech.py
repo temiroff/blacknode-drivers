@@ -167,10 +167,14 @@ def test_feetech_calibration_provider_opens_normalized_session(monkeypatch):
         def __init__(self, config):
             captured.append(config)
 
-    monkeypatch.setattr(calibration, "FeetechCalibrationSession", FakeSession)
     provider = _NODE_REGISTRY[
         "FeetechCalibrationProvider"
     ]._bn_robot_calibration_provider
+    monkeypatch.setitem(
+        provider["open_session"].__globals__,
+        "FeetechCalibrationSession",
+        FakeSession,
+    )
     session = provider["open_session"]({
         "profile": {
             "id": "test_arm",
