@@ -2,6 +2,7 @@ import math
 import runpy
 from pathlib import Path
 import time
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -62,6 +63,59 @@ def test_feetech_component_registers_expected_nodes():
         raw_provider._bn_robot_raw_monitor_provider["capability"]
         == "raw_position_feedback"
     )
+
+
+def test_driver_owner_watch_stops_when_parent_disappears(monkeypatch):
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "components"
+        / "feetech"
+        / "adapters"
+        / "ros2"
+        / "runtime"
+        / "feetech_bus_driver.py"
+    )
+    runtime = runpy.run_path(str(runtime_path))
+    stop_event = threading.Event()
+    monkeypatch.setenv("BLACKNODE_PARENT_PID", "424242")
+    monkeypatch.delenv("BLACKNODE_DRIVER_STOP_FILE", raising=False)
+    monkeypatch.setitem(
+        runtime["_watch_owner"].__globals__,
+        "_process_alive",
+        lambda _pid: False,
+    )
+
+    watcher = runtime["_watch_owner"](stop_event)
+
+    assert watcher is not None
+    assert stop_event.wait(1.0)
+
+
+def test_shutdown_release_uses_verified_all_joint_path(monkeypatch):
+    runtime_path = (
+        Path(__file__).resolve().parents[1]
+        / "components"
+        / "feetech"
+        / "adapters"
+        / "ros2"
+        / "runtime"
+        / "feetech_bus_driver.py"
+    )
+    runtime = runpy.run_path(str(runtime_path))
+    calls = []
+    joint = object()
+    release = runtime["_release_torque_on_shutdown"]
+    monkeypatch.setitem(
+        release.__globals__,
+        "_disable_all_torque",
+        lambda sdk, packet, port, joints: calls.append(
+            (sdk, packet, port, joints)
+        ) or (True, ""),
+    )
+
+    release("sdk", "packet", "port", {"joint": joint})
+
+    assert calls == [("sdk", "packet", "port", {"joint": joint})]
 
 
 def test_feetech_ros2_adapter_resolves_layer_dependencies_and_stays_disarmed():

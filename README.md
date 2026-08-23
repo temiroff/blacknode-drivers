@@ -21,7 +21,7 @@ Install the repository, enable the required component or adapter in **Packages**
 - Configuration is inert; probing is read-only and requires confirmation.
 - Torque enable seeds every joint from fresh feedback before activation.
 - Commands are clamped again at the driver boundary.
-- Communication loss, partial failure, and shutdown return configured joints to torque-off.
+- Communication loss, partial failure, parent-process exit, and graceful shutdown return configured joints to torque-off and verify the physical torque registers.
 - Support the robot before releasing torque; an unsupported arm may fall.
 - Physical limits are never discovered by driving into hard stops.
 

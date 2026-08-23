@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import signal
 import sys
@@ -47,6 +48,59 @@ _HARDWARE_ERROR_BITS = {
     0x08: "overcurrent",
     0x20: "overload",
 }
+
+
+def _process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _watch_owner(stop_event: threading.Event) -> threading.Thread | None:
+    """Stop safely when the owning Blacknode server exits or requests stop."""
+    raw_parent_pid = str(os.environ.get("BLACKNODE_PARENT_PID") or "").strip()
+    stop_file = str(os.environ.get("BLACKNODE_DRIVER_STOP_FILE") or "").strip()
+    try:
+        parent_pid = int(raw_parent_pid) if raw_parent_pid else 0
+    except ValueError:
+        parent_pid = 0
+    if parent_pid <= 0 and not stop_file:
+        return None
+
+    def watch() -> None:
+        while not stop_event.wait(0.2):
+            stop_requested = bool(stop_file and os.path.exists(stop_file))
+            owner_gone = bool(parent_pid > 0 and not _process_alive(parent_pid))
+            if stop_requested or owner_gone:
+                stop_event.set()
+                return
+
+    thread = threading.Thread(
+        target=watch,
+        name="blacknode-driver-owner-watch",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _release_torque_on_shutdown(
+    sdk: Any,
+    packet: Any,
+    port: Any,
+    joints: dict[str, "JointSpec"],
+) -> None:
+    released, error = _disable_all_torque(sdk, packet, port, joints)
+    if not released:
+        print(
+            f"torque-off verification FAILED: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _decode_hardware_error_flags(flags: int) -> list[str]:
@@ -1194,6 +1248,7 @@ def main() -> int:
         _fail(release_error)
 
     stop_event = threading.Event()
+    _watch_owner(stop_event)
 
     def handle_stop(*_: Any) -> None:
         stop_event.set()
@@ -1216,8 +1271,7 @@ def main() -> int:
             )
         finally:
             if args.torque_off_on_exit:
-                for joint in joints.values():
-                    _set_torque(sdk, packet, port, joint.servo_id, False)
+                _release_torque_on_shutdown(sdk, packet, port, joints)
             port.closePort()
         return 0
 
@@ -1337,8 +1391,7 @@ def main() -> int:
                 publish_state(last_known_ticks)
     finally:
         if args.torque_off_on_exit:
-            for name, joint in joints.items():
-                _set_torque(sdk, packet, port, joint.servo_id, False)  # best-effort; ignore result on shutdown
+            _release_torque_on_shutdown(sdk, packet, port, joints)
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
