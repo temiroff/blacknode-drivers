@@ -334,6 +334,70 @@ def test_feetech_motion_command_requires_armed_healthy_session(monkeypatch):
         )
 
 
+@pytest.fixture
+def direct_position_session():
+    registers = {40: 1, 56: 0, 57: 8, 62: 120, 63: 25, 65: 0}
+    writes, released = [], []
+    session = calibration.FeetechCalibrationSession.__new__(calibration.FeetechCalibrationSession)
+    session.sdk = SimpleNamespace(COMM_SUCCESS=0)
+    session.port = object()
+    session.joints = {"shoulder": bus.JointSpec("shoulder", 6, -30, 45)}
+    session._armed = True
+    def write(_port, servo_id, address, length, data):
+        writes.append((servo_id, address, list(data)))
+        registers.update({address + index: value for index, value in enumerate(data)})
+        return 0, 0
+    session.packet = SimpleNamespace(
+        read2ByteTxRx=lambda *args: (777, 0, 0), read1ByteTxRx=lambda *args: (0, 0, 0),
+        readTxRx=lambda _port, _id, address, length: ([registers.get(address + i, 0) for i in range(length)], 0, 0),
+        writeTxRx=write,
+    )
+    def release():
+        released.append(True)
+        session._armed = False
+        registers[40] = 0
+        return session.sample()
+    session.release = release
+    return session, registers, writes, released
+
+
+def test_direct_position_packet_contains_full_clamped_goal_speed_and_acceleration(direct_position_session):
+    session, registers, writes, released = direct_position_session
+    result = session.command_position_target({"shoulder": 999}, max_velocity_deg_s=180,
+                                              deadline=time.monotonic() + 1)
+    assert writes == [(6, 41, [50, 0, 10, 0, 0, 0, 8])]
+    assert result["servos"]["shoulder"]["goal_position_ticks"] == 2560
+    assert result["servos"]["shoulder"]["goal_speed_ticks_s"] == 2048
+    assert result["torque_enabled"] and not released
+    assert registers[40] == 1
+
+
+@pytest.mark.parametrize("failure", ["disarmed", "stale", "speed", "warning", "model", "mode"])
+def test_direct_position_invalid_preflight_never_writes_goals(direct_position_session, failure):
+    session, registers, writes, released = direct_position_session
+    if failure == "disarmed": session._armed = False
+    if failure == "warning": registers[65] = 32
+    if failure == "model": session.packet.read2ByteTxRx = lambda *args: (123, 0, 0)
+    if failure == "mode": session.packet.read1ByteTxRx = lambda *args: (1, 0, 0)
+    with pytest.raises((PermissionError, TimeoutError, ValueError, RuntimeError)):
+        session.command_position_target({"shoulder": 20}, max_velocity_deg_s=999 if failure == "speed" else 180,
+                                        deadline=time.monotonic() + (-1 if failure == "stale" else 1))
+    assert not writes
+
+
+def test_direct_position_mismatched_speed_readback_releases_torque(direct_position_session):
+    session, registers, writes, released = direct_position_session
+    write = session.packet.writeTxRx
+    def wrong(*args):
+        result = write(*args)
+        registers[46] = registers[47] = 0
+        return result
+    session.packet.writeTxRx = wrong
+    with pytest.raises(RuntimeError, match="readback"):
+        session.command_position_target({"shoulder": 20}, max_velocity_deg_s=180, deadline=time.monotonic() + 1)
+    assert released and not session._armed
+
+
 def test_joint_parsing_conversion_and_validation():
     joints = bus.parse_joint_map(
         "shoulder:1:-90:90,gripper:6:-10:80",
@@ -754,6 +818,34 @@ def test_calibration_sample_preserves_warning_bearing_servo_feedback():
         "hardware_error_flags": 1,
         "hardware_errors": ["voltage"],
     }
+
+
+@pytest.mark.parametrize("flags,status", [(0, 0), (1, 32)])
+def test_combined_feedback_reads_all_health_fields_in_one_packet(flags, status):
+    calls = []
+    data = [0] * 26
+    data[0], data[16], data[17], data[22], data[23], data[25] = 1, 0x21, 0x03, 119, 32, status
+    def read(port, servo_id, address, length):
+        calls.append((servo_id, address, length))
+        return data, 0, flags
+    result = bus.read_servo_feedback(SimpleNamespace(COMM_SUCCESS=0), SimpleNamespace(readTxRx=read), object(), 6)
+    assert calls == [(6, 40, 26)]
+    assert result["ticks"] == 801 and result["torque_enabled"] is True
+    assert result["diagnostics"]["voltage_v"] == 11.9
+    assert result["diagnostics"]["temperature_c"] == 32
+    assert result["flags"] == flags | status
+
+
+@pytest.mark.parametrize("failure", ["timeout", "short", "ticks", "torque", "bytes"])
+def test_combined_feedback_rejects_incomplete_or_invalid_packets(failure):
+    data = [0] * 26
+    if failure == "short": data.pop()
+    if failure == "ticks": data[17] = 16
+    if failure == "torque": data[0] = 2
+    if failure == "bytes": data[22] = 999
+    packet = SimpleNamespace(readTxRx=lambda *args: (data, -6 if failure == "timeout" else 0, 0))
+    result = bus.read_servo_feedback(SimpleNamespace(COMM_SUCCESS=0), packet, object(), 6)
+    assert result["ticks"] is None and result["torque_enabled"] is None and result["diagnostics"] is None
 
 
 def test_driver_goal_seed_retries_then_fails_without_confirmation():
