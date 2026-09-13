@@ -189,6 +189,15 @@ def open_port(sdk: Any, port_name: str, baudrate: int) -> Any:
     try:
         if not port.openPort() or not port.setBaudRate(int(baudrate)):
             raise RuntimeError("SDK rejected the port or baud rate")
+        # Windows serial handles are exclusive. On POSIX, serialize Blacknode
+        # owners and reject new external opens for this connection's lifetime.
+        import os
+        if os.name == "posix" and getattr(port, "ser", None) is not None:
+            import fcntl
+            import termios
+            descriptor = port.ser.fileno()
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.ioctl(descriptor, termios.TIOCEXCL)
     except Exception as exc:
         try:
             port.closePort()
@@ -304,6 +313,37 @@ def read_servo_diagnostics(
         "hardware_error_flags": flags,
         "hardware_errors": decode_hardware_errors(flags),
     }
+
+
+def read_servo_feedback(sdk: Any, packet: Any, port: Any, servo_id: int) -> dict[str, Any]:
+    """Read torque, position and diagnostics in one contiguous status packet."""
+    if not callable(getattr(packet, "readTxRx", None)):
+        ticks, position_flags = read_position_status(sdk, packet, port, servo_id)
+        torque, torque_flags = read_torque_enabled_status(sdk, packet, port, servo_id)
+        return {"ticks": ticks, "torque_enabled": torque, "flags": position_flags | torque_flags,
+                "diagnostics": read_servo_diagnostics(sdk, packet, port, servo_id)}
+    failed = {"ticks": None, "torque_enabled": None, "flags": 0, "diagnostics": None}
+    try:
+        data, result, flags = packet.readTxRx(port, servo_id, 40, 26)
+        failed["flags"] = int(flags or 0)
+        if result != sdk.COMM_SUCCESS or len(data) != 26:
+            return failed
+        if any(isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255 for value in data):
+            return failed
+        ticks = data[16] | (data[17] << 8)
+        if not 0 <= ticks < TICKS_PER_REV or data[0] not in (0, 1):
+            return failed
+        status = data[25]
+        hardware_flags = int(flags or 0) | status
+        return {"ticks": ticks, "torque_enabled": bool(data[0]), "flags": hardware_flags,
+                "diagnostics": {"voltage_v": data[22] / 10.0, "temperature_c": float(data[23]),
+                                "goal_position_ticks": data[2] | (data[3] << 8),
+                                "goal_time_ms": data[4] | (data[5] << 8),
+                                "goal_speed_ticks_s": data[6] | (data[7] << 8), "acceleration": data[1],
+                                "servo_status": status, "hardware_error_flags": hardware_flags,
+                                "hardware_errors": decode_hardware_errors(hardware_flags)}}
+    except Exception:
+        return failed
 
 
 def probe_bus(config: Mapping[str, Any], sdk: Any | None = None) -> dict[str, Any]:

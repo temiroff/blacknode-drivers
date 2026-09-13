@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import math
 from typing import Any, Mapping
 
 from blacknode.node import Bool, Dict, Text, node
@@ -77,12 +78,13 @@ class FeetechCalibrationSession:
         operation_count = 0
         packet_error_count = 0
         for name, joint in self.joints.items():
-            ticks, position_flags = bus.read_position_status(
+            feedback = bus.read_servo_feedback(
                 self.sdk,
                 self.packet,
                 self.port,
                 joint.servo_id,
             )
+            ticks, position_flags = feedback["ticks"], feedback["flags"]
             operation_count += 1
             if ticks is None:
                 packet_error_count += 1
@@ -91,12 +93,7 @@ class FeetechCalibrationSession:
                 )
             else:
                 pose[name] = bus.ticks_to_degrees(ticks, joint)
-            torque_enabled, torque_flags = bus.read_torque_enabled_status(
-                self.sdk,
-                self.packet,
-                self.port,
-                joint.servo_id,
-            )
+            torque_enabled, torque_flags = feedback["torque_enabled"], feedback["flags"]
             operation_count += 1
             if torque_enabled is None:
                 packet_error_count += 1
@@ -106,15 +103,11 @@ class FeetechCalibrationSession:
                 )
             else:
                 torque_states[name] = torque_enabled
-            diagnostics = bus.read_servo_diagnostics(
-                self.sdk,
-                self.packet,
-                self.port,
-                joint.servo_id,
-            )
+            diagnostics = feedback["diagnostics"]
             operation_count += 1
             if diagnostics is None:
                 packet_error_count += 1
+                errors.append(f"could not read diagnostics for {name} (servo {joint.servo_id})")
                 diagnostics = {}
             hardware_flags = (
                 int(position_flags)
@@ -151,6 +144,8 @@ class FeetechCalibrationSession:
                 "servo_status": diagnostics.get("servo_status"),
                 "hardware_error_flags": hardware_flags,
                 "hardware_errors": hardware_errors,
+                **{key: diagnostics[key] for key in ("goal_position_ticks", "goal_time_ms", "goal_speed_ticks_s", "acceleration")
+                   if key in diagnostics},
             }
         torque_enabled: bool | None = (
             any(torque_states.values())
@@ -281,6 +276,57 @@ class FeetechCalibrationSession:
             except Exception:
                 pass
 
+    def command_position_target(self, positions_deg: Mapping[str, float], *,
+                                max_velocity_deg_s: float, deadline: float) -> dict[str, Any]:
+        """Send the target directly; enforce finite velocity in the servo itself."""
+        if not self._armed:
+            raise PermissionError("joint motion is disarmed")
+        if not math.isfinite(max_velocity_deg_s) or not 360 / bus.TICKS_PER_REV <= max_velocity_deg_s <= 180:
+            raise ValueError("Position tracking speed must be within one tick/s–180 degrees/s")
+        if time.monotonic() > deadline:
+            raise TimeoutError("joint command is stale")
+        before = self.sample()
+        if before.get("torque_enabled") is not True or before.get("errors") or before.get("warnings"):
+            self.release()
+            raise RuntimeError("live feedback or hardware health blocks motion")
+        try:
+            if not getattr(self, "_position_target_models_checked", False):
+                for joint in self.joints.values():
+                    model, result, flags = self.packet.read2ByteTxRx(self.port, joint.servo_id, 3)
+                    mode, mode_result, mode_flags = self.packet.read1ByteTxRx(self.port, joint.servo_id, 33)
+                    if (model != 777 or mode != 0 or result != self.sdk.COMM_SUCCESS
+                            or mode_result != self.sdk.COMM_SUCCESS or flags or mode_flags):
+                        raise ValueError("Direct position targets require a healthy STS3215 in position mode")
+                self._position_target_models_checked = True
+            expected = {}
+            for name, degrees in positions_deg.items():
+                if name not in self.joints or not math.isfinite(float(degrees)):
+                    raise ValueError("invalid joint position target")
+                if time.monotonic() > deadline:
+                    raise TimeoutError("joint command is stale")
+                joint = self.joints[name]
+                ticks = bus.degrees_to_ticks(bus.clamp_degrees(float(degrees), joint), joint)
+                speed = max(1, int(max_velocity_deg_s * bus.TICKS_PER_REV / 360))
+                # Feetech WritePosEx packet: acceleration, goal, zero goal time,
+                # bounded speed. RAM only; no EEPROM or ID writes.
+                data = [50, ticks & 255, ticks >> 8, 0, 0, speed & 255, speed >> 8]
+                expected[name] = (ticks, speed)
+                result, flags = self.packet.writeTxRx(self.port, joint.servo_id, 41, len(data), data)
+                if result != self.sdk.COMM_SUCCESS or flags:
+                    raise RuntimeError("position target was not acknowledged")
+            after = self.sample()
+            if after.get("torque_enabled") is not True or after.get("errors") or after.get("warnings"):
+                raise RuntimeError("position target feedback failed")
+            for name, (ticks, speed) in expected.items():
+                actual = (after.get("servos") or {}).get(name) or {}
+                if (actual.get("goal_position_ticks") != ticks or actual.get("goal_speed_ticks_s") != speed
+                        or actual.get("goal_time_ms") != 0 or actual.get("acceleration") != 50):
+                    raise RuntimeError("position target or bounded speed readback did not match")
+            return after
+        except Exception:
+            self.release()
+            raise
+
 
 def open_calibration_session(ctx: Mapping[str, Any]) -> FeetechCalibrationSession:
     return FeetechCalibrationSession(_bus_config(ctx))
@@ -323,4 +369,5 @@ feetech_calibration_provider._bn_robot_joint_motion_provider = {
     "component": "feetech",
     "capability": "joint_group",
     "open_session": open_calibration_session,
+    "supports_position_targets": True,
 }
